@@ -246,13 +246,14 @@ class ResourcesMixin:
 
         Args:
             agent_name: Name of the agent
-            timeout_seconds: Timeout in seconds (must be 60-7200, i.e., 1 min to 2 hours)
+            timeout_seconds: Timeout in seconds (at least 60; the ceiling is enforced by the router)
 
         Returns:
             True if update succeeded
         """
-        # Validate range: 1 minute minimum, 2 hours maximum
-        if timeout_seconds < 60 or timeout_seconds > 7200:
+        # Floor only: the fleet ceiling (default 2 hours) is enforced by the router,
+        # and a hard upper bound here would defeat an admin-raised ceiling.
+        if timeout_seconds < 60:
             return False
 
         stmt = (

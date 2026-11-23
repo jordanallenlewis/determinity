@@ -2072,6 +2072,15 @@ class MaxParallelTasksCeilingUpdate(BaseModel):
     value: int
 
 
+class MaxExecutionTimeoutUpdate(BaseModel):
+    """Body for PUT /api/settings/max-execution-timeout.
+
+    Range (60-604800 s) is enforced in the router so an out-of-range value
+    returns a 400 with a descriptive message rather than a generic 422.
+    """
+    value: int
+
+
 class ProactiveRateLimitsUpdate(BaseModel):
     """Body for PUT /api/settings/proactive-rate-limits (#1609).
 

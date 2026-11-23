@@ -170,14 +170,15 @@ def resolve_turn_timeout(agent_name: str) -> int:
     """The bound on ONE turn = the agent's own execution timeout (TIMEOUT-001).
 
     The per-agent knob operators already set via ``PUT /api/agents/{name}/timeout``
-    (default 3600, range 60–7200). Read-side clamped into that same range and
+    (default 3600, range 60 up to the fleet ceiling, 7200 unless an admin raised it). Read-side clamped into that same range and
     fail-open to the platform default — a DB hiccup must never produce a 0s or
     crashed turn. Deliberately distinct from ``resolve_lock_ttl`` (see the
     constants block above for why the fallbacks differ).
     """
     try:
         t = int(db.get_execution_timeout(agent_name))
-        return max(TURN_TIMEOUT_MIN_SECONDS, min(t, TURN_TIMEOUT_MAX_SECONDS))
+        from services.settings_service import get_max_execution_timeout
+        return max(TURN_TIMEOUT_MIN_SECONDS, min(t, get_max_execution_timeout()))
     except Exception as e:
         logger.warning(
             "[SessionTurn] get_execution_timeout failed for %s (%s) — using default %ds",

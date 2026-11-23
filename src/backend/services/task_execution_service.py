@@ -952,7 +952,8 @@ async def dispatch_and_await_terminal(
     try:
         agent_timeout = float(db.get_execution_timeout(agent_name))
     except Exception:  # noqa: BLE001 — a config read must not break dispatch
-        agent_timeout = 7200.0
+        from services.settings_service import get_max_execution_timeout
+        agent_timeout = float(get_max_execution_timeout())
     if wait_timeout is None:
         wait_timeout = agent_timeout + 120.0
     if claim_budget is None:

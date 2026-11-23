@@ -1568,6 +1568,38 @@ def get_max_parallel_tasks_ceiling() -> int:
 
 
 # ============================================================================
+# Max Execution Timeout (fleet-wide ceiling on per-agent run time)
+# ============================================================================
+
+MAX_EXECUTION_TIMEOUT_KEY = "max_execution_timeout_seconds"
+MAX_EXECUTION_TIMEOUT_DEFAULT = 7200  # 2 h: upstream behaviour unless an admin raises it
+MAX_EXECUTION_TIMEOUT_MIN = 60
+MAX_EXECUTION_TIMEOUT_MAX = 604_800   # 7 days
+
+
+def get_max_execution_timeout() -> int:
+    """Fleet-wide ceiling on any agent's ``execution_timeout_seconds``.
+
+    An admin sets it (60 s to 7 days, default 2 h); owners pick a per-agent
+    value within it. A garbage or absent value falls back to the default and
+    an out-of-range integer is clamped, so a stray store value can neither
+    reject every save nor lift the cap past 7 days. Read-through every call
+    (the backend runs several workers; a cache would keep a stale ceiling).
+    """
+    try:
+        raw = settings_service.get_setting(MAX_EXECUTION_TIMEOUT_KEY)
+    except Exception:
+        return MAX_EXECUTION_TIMEOUT_DEFAULT
+    if raw is None:
+        return MAX_EXECUTION_TIMEOUT_DEFAULT
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return MAX_EXECUTION_TIMEOUT_DEFAULT
+    return max(MAX_EXECUTION_TIMEOUT_MIN, min(MAX_EXECUTION_TIMEOUT_MAX, parsed))
+
+
+# ============================================================================
 # Queue stall alert threshold (#4257 — how long a queued head may wait)
 # ============================================================================
 

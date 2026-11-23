@@ -582,7 +582,8 @@ async def set_agent_timeout(
     Set the execution timeout for an agent.
 
     Body:
-    - execution_timeout_seconds: Timeout in seconds (60-7200, i.e., 1 min to 2 hours)
+    - execution_timeout_seconds: Timeout in seconds (60 up to the fleet ceiling,
+      default 7200 = 2 hours; admins raise it via PUT /api/settings/max-execution-timeout)
 
     Applies to new runs. Runs already in progress keep their current limit;
     queued pull-dispatched jobs with a longer timeout are cut to this one
@@ -601,11 +602,18 @@ async def set_agent_timeout(
     if timeout_seconds is None:
         raise HTTPException(status_code=400, detail="execution_timeout_seconds is required")
 
-    # Validate range: 1 minute to 2 hours
-    if not isinstance(timeout_seconds, int) or timeout_seconds < 60 or timeout_seconds > 7200:
+    # Validate range: 1 minute up to the admin-set fleet ceiling (default 2 hours)
+    from services.settings_service import get_max_execution_timeout
+    max_timeout = get_max_execution_timeout()
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds < 60
+        or timeout_seconds > max_timeout
+    ):
         raise HTTPException(
             status_code=400,
-            detail="execution_timeout_seconds must be an integer between 60 and 7200 (1 min to 2 hours)"
+            detail=f"execution_timeout_seconds must be an integer between 60 and {max_timeout}"
         )
 
     # #929 Approach A: the agent cap is the schedule ceiling, so refuse to

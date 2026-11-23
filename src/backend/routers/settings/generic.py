@@ -71,6 +71,7 @@ from services.settings_service import (
     AGENT_DEFAULT_REQUIRE_EMAIL,
     get_agent_default_require_email,
     MAX_PARALLEL_TASKS_CEILING_KEY,
+    MAX_EXECUTION_TIMEOUT_KEY,
     QUEUE_STALL_ALERT_MINUTES_KEY,
     MAX_PARALLEL_TASKS_CEILING_DEFAULT,
     MAX_PARALLEL_TASKS_CEILING_MIN,
@@ -271,6 +272,15 @@ async def update_setting(
             detail=(
                 "queue_stall_alert_minutes must be set via "
                 "PUT /api/settings/queue-stall-alert-minutes (range-validated 5–1440)"
+            ),
+        )
+
+    if key == MAX_EXECUTION_TIMEOUT_KEY:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "max_execution_timeout_seconds must be set via "
+                "PUT /api/settings/max-execution-timeout (range-validated 60-604800)"
             ),
         )
 

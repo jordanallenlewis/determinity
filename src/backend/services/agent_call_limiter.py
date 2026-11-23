@@ -187,7 +187,9 @@ INFLIGHT_REDIS_RETRY_SECONDS = 30.0
 INFLIGHT_DEADLINE_SLACK_SECONDS = 60.0
 # The widest HTTP timeout a caller can carry (TIMEOUT-001 ceiling + margin);
 # used only when a caller does not supply its own.
-_MAX_HTTP_TIMEOUT_SECONDS = 7200.0 + 60.0
+def _max_http_timeout_seconds() -> float:
+    from services.settings_service import get_max_execution_timeout
+    return float(get_max_execution_timeout()) + 60.0
 
 
 @dataclass
@@ -220,7 +222,7 @@ _slot_renewer: Optional[Callable[[str, str], bool]] = None
 def _queue_wait_bound_seconds() -> float:
     """How long a call may sit in the semaphore queue at most."""
     timeout = BACKEND_AGENT_CALL_QUEUE_TIMEOUT_S
-    return float(timeout) if timeout > 0 else _MAX_HTTP_TIMEOUT_SECONDS
+    return float(timeout) if timeout > 0 else _max_http_timeout_seconds()
 
 
 def inflight_max_age_seconds() -> float:
@@ -228,7 +230,7 @@ def inflight_max_age_seconds() -> float:
     the queue wait bound + the widest HTTP timeout + slack. The watchdog
     uses it to scope an ``unknown`` verdict (Redis unreadable) — rows older
     than this cannot be in flight, so they are orphaned regardless."""
-    return _queue_wait_bound_seconds() + _MAX_HTTP_TIMEOUT_SECONDS + INFLIGHT_DEADLINE_SLACK_SECONDS
+    return _queue_wait_bound_seconds() + _max_http_timeout_seconds() + INFLIGHT_DEADLINE_SLACK_SECONDS
 
 
 def _marker_key(execution_id: str) -> str:
@@ -371,7 +373,7 @@ def _ensure_refresher() -> None:
 
 def register_inflight(execution_id: str, agent_name: str, http_timeout: Optional[float]) -> InflightEntry:
     now = time.monotonic()
-    bound = float(http_timeout) if isinstance(http_timeout, (int, float)) and http_timeout > 0 else _MAX_HTTP_TIMEOUT_SECONDS
+    bound = float(http_timeout) if isinstance(http_timeout, (int, float)) and http_timeout > 0 else _max_http_timeout_seconds()
     entry = InflightEntry(
         execution_id=execution_id,
         agent_name=agent_name,

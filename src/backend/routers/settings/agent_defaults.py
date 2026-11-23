@@ -30,6 +30,7 @@ from models import (
     TemplateRegistryUpdate,
     QueueStallAlertMinutesUpdate,
     MaxParallelTasksCeilingUpdate,
+    MaxExecutionTimeoutUpdate,
     McpUrlUpdate,
     OpsSettingsUpdate,
     RetentionAcknowledge,
@@ -75,6 +76,11 @@ from services.settings_service import (
     MAX_PARALLEL_TASKS_CEILING_MIN,
     MAX_PARALLEL_TASKS_CEILING_MAX,
     get_max_parallel_tasks_ceiling,
+    MAX_EXECUTION_TIMEOUT_KEY,
+    MAX_EXECUTION_TIMEOUT_DEFAULT,
+    MAX_EXECUTION_TIMEOUT_MIN,
+    MAX_EXECUTION_TIMEOUT_MAX,
+    get_max_execution_timeout,
     get_queue_stall_alert_minutes,
     PROACTIVE_RATE_LIMIT_DEFAULTS,
     PROACTIVE_RATE_LIMIT_DESCRIPTIONS,
@@ -482,3 +488,69 @@ async def update_max_parallel_tasks_ceiling_setting(
         "min": MAX_PARALLEL_TASKS_CEILING_MIN,
         "max": MAX_PARALLEL_TASKS_CEILING_MAX,
     }
+
+
+def _max_execution_timeout_body() -> dict:
+    return {
+        "value": get_max_execution_timeout(),
+        "default": MAX_EXECUTION_TIMEOUT_DEFAULT,
+        "min": MAX_EXECUTION_TIMEOUT_MIN,
+        "max": MAX_EXECUTION_TIMEOUT_MAX,
+    }
+
+
+@router.get("/max-execution-timeout")
+async def get_max_execution_timeout_setting(
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """Get the fleet-wide ceiling on per-agent execution timeouts. Admin-only."""
+    assert_admin(current_user)
+    return _max_execution_timeout_body()
+
+
+@router.put("/max-execution-timeout")
+async def update_max_execution_timeout_setting(
+    body: MaxExecutionTimeoutUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """Set the fleet-wide ceiling on per-agent execution timeouts.
+
+    Admin-only. Validates 60 <= value <= 604800 (7 days). The ceiling is
+    checked when an owner saves a per-agent timeout; stored per-agent values
+    are never rewritten, so lowering it does not cut runs already configured.
+    """
+    assert_admin(current_user)
+
+    if (
+        not isinstance(body.value, int)
+        or body.value < MAX_EXECUTION_TIMEOUT_MIN
+        or body.value > MAX_EXECUTION_TIMEOUT_MAX
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"max_execution_timeout_seconds must be an integer between "
+                f"{MAX_EXECUTION_TIMEOUT_MIN} and {MAX_EXECUTION_TIMEOUT_MAX}"
+            ),
+        )
+
+    db.set_setting(MAX_EXECUTION_TIMEOUT_KEY, str(body.value))
+
+    await platform_audit_service.log(
+        event_type=AuditEventType.CONFIGURATION,
+        event_action="settings_change",
+        source="api",
+        actor_user=current_user,
+        actor_ip=request.client.host if request.client else None,
+        endpoint=request.scope["path"],
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "setting": MAX_EXECUTION_TIMEOUT_KEY,
+            "action": "update",
+            "value": body.value,
+        },
+    )
+
+    return {"success": True, **_max_execution_timeout_body()}
