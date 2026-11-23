@@ -108,7 +108,7 @@ jobs:
         env:
           CONFLICT: ${{ steps.merge.outputs.conflict }}
           GATE: ${{ steps.gate.outcome }}
-        run: echo "dry run: conflict=$CONFLICT gate=$GATE; nothing pushed"
+        run: 'echo "dry run - conflict=$CONFLICT gate=$GATE, nothing pushed"'
 
       - name: Open a PR for a human
         if: steps.rel.outputs.needed == 'true' && env.DRY != 'true' && (steps.merge.outputs.conflict == 'true' || steps.gate.outcome == 'failure')
