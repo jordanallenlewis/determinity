@@ -1,0 +1,127 @@
+name: hq upstream sync
+
+# Daily, no LLM. Looks at the latest Abilityai/trinity release. If `hq` does not
+# contain it yet, merges the tag into `hq`, gates on the frontend build, pushes,
+# and starts the image build. Clean merge + green gate = images. Conflict or red
+# gate = a pull request on this fork (branch hq-sync/<tag>-<run>) for a human to
+# fix; patches the release already contains are dropped while resolving.
+#
+# workflow_dispatch input `tag` forces a tag; `dry_run` merges and gates but
+# pushes nothing (proves the path end to end).
+
+on:
+  schedule:
+    - cron: '17 11 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to merge (default: latest release)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Merge and gate, push nothing'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: hq-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_TAG: ${{ inputs.tag }}
+      DRY: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: hq
+          fetch-depth: 0
+          submodules: false
+
+      - name: Pick the release
+        id: rel
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$(gh api repos/Abilityai/trinity/releases/latest --jq .tag_name)"
+          fi
+          case "$tag" in v[0-9]*) ;; *) echo "odd tag '$tag'"; exit 1;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags https://github.com/Abilityai/trinity.git "refs/tags/$tag:refs/tags/upstream-$tag"
+          if git merge-base --is-ancestor "refs/tags/upstream-$tag" HEAD; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "hq already contains $tag"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge
+        id: merge
+        if: steps.rel.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-commit --no-ff "refs/tags/upstream-$TAG"
+          # The fork keeps its own workflows; upstream's workflow changes are not wanted here.
+          git checkout HEAD -- .github/workflows 2>/dev/null || true
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            git commit -q -m "Merge upstream release $TAG into hq"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.merge.outputs.conflict == 'false'
+        with:
+          node-version: 22
+      - name: Gate
+        id: gate
+        if: steps.merge.outputs.conflict == 'false'
+        continue-on-error: true
+        run: |
+          cd src/frontend && npm ci && npm run build
+          cd ../.. && python3 -m compileall -q src/backend src/scheduler
+
+      - name: Push to hq and build images
+        if: steps.merge.outputs.conflict == 'false' && steps.gate.outcome == 'success' && env.DRY != 'true'
+        run: |
+          git push origin HEAD:hq
+          gh workflow run hq-images.yml --ref hq
+
+      - name: Dry run result
+        if: steps.rel.outputs.needed == 'true' && env.DRY == 'true'
+        env:
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          GATE: ${{ steps.gate.outcome }}
+        run: echo "dry run: conflict=$CONFLICT gate=$GATE; nothing pushed"
+
+      - name: Open a PR for a human
+        if: steps.rel.outputs.needed == 'true' && env.DRY != 'true' && (steps.merge.outputs.conflict == 'true' || steps.gate.outcome == 'failure')
+        env:
+          TAG: ${{ steps.rel.outputs.tag }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          GATE: ${{ steps.gate.outcome }}
+          RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          br="hq-sync/$TAG-$RUN"
+          git add -A
+          git commit -q -m "Merge upstream release $TAG into hq (needs attention)" || true
+          git push origin "HEAD:refs/heads/$br"
+          gh pr create --base hq --head "$br" --title "Sync upstream $TAG into hq" \
+            --body "Upstream release $TAG did not merge cleanly (conflict: $CONFLICT, gate: $GATE). Resolve, drop any patch the release already contains, then merge."

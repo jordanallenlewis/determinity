@@ -1,0 +1,136 @@
+name: hq images
+
+# Builds the four runtime images from the `hq` branch (upstream release plus our
+# patches) and publishes them to this fork's GHCR namespace. Tags:
+#   hq-<VERSION>-<sha7>  immutable, what a deploy pins
+#   hq                   moving, latest build of the branch
+# Mirrors upstream's publish-images.yml (OSS tree only, no submodules).
+
+on:
+  push:
+    branches: [hq]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: hq-images
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: gate (frontend build, backend syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Frontend build
+        working-directory: src/frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Backend and scheduler compile
+        run: python3 -m compileall -q src/backend src/scheduler
+
+  publish:
+    name: ${{ matrix.image }}
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: trinity-backend
+            context: .
+            dockerfile: docker/backend/Dockerfile
+            build_args: provenance
+          - image: trinity-frontend
+            context: ./src/frontend
+            dockerfile: docker/frontend/Dockerfile.prod
+            build_args: none
+          - image: trinity-scheduler
+            context: .
+            dockerfile: docker/scheduler/Dockerfile
+            build_args: none
+          - image: trinity-mcp-server
+            context: ./src/mcp-server
+            dockerfile: src/mcp-server/Dockerfile
+            build_args: none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - name: Collect build provenance
+        id: prov
+        run: |
+          {
+            echo "version=$(tr -d '[:space:]' < VERSION)"
+            echo "git_commit=$(git rev-parse HEAD)"
+            echo "short_sha=$(git rev-parse --short=7 HEAD)"
+            echo "git_commit_subject=$(git log -1 --pretty=%s | tr -d '\n\r')"
+            echo "git_commit_timestamp=$(git log -1 --pretty=%cI)"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select build args
+        id: args
+        env:
+          KIND: ${{ matrix.build_args }}
+          P_VERSION: ${{ steps.prov.outputs.version }}
+          P_GIT_COMMIT: ${{ steps.prov.outputs.git_commit }}
+          P_GIT_COMMIT_SUBJECT: ${{ steps.prov.outputs.git_commit_subject }}
+          P_GIT_COMMIT_TIMESTAMP: ${{ steps.prov.outputs.git_commit_timestamp }}
+          P_BUILD_DATE: ${{ steps.prov.outputs.build_date }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<TRINITY_EOF'
+            if [ "$KIND" = provenance ]; then
+              echo "VERSION=hq-${P_VERSION}"
+              echo "GIT_COMMIT=${P_GIT_COMMIT}"
+              echo "GIT_COMMIT_SUBJECT=${P_GIT_COMMIT_SUBJECT}"
+              echo "GIT_COMMIT_TIMESTAMP=${P_GIT_COMMIT_TIMESTAMP}"
+              echo "GIT_BRANCH=hq"
+              echo "BUILD_DATE=${P_BUILD_DATE}"
+            fi
+            echo 'TRINITY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Image name (lowercase owner)
+        id: name
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+        run: echo "ref=ghcr.io/${OWNER,,}/${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.name.outputs.ref }}:hq-${{ steps.prov.outputs.version }}-${{ steps.prov.outputs.short_sha }}
+            ${{ steps.name.outputs.ref }}:hq
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.prov.outputs.git_commit }}
+          cache-from: type=gha,scope=hq-${{ matrix.image }}
+          cache-to: type=gha,scope=hq-${{ matrix.image }},mode=max
+          build-args: ${{ steps.args.outputs.build_args }}
