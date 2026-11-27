@@ -1,0 +1,107 @@
+# agents.nft.example - fence for the Docker bridge that hosts Trinity agent containers.
+#
+# Trinity's default agent network is "trinity-agent-network", subnet 172.28.0.0/16, gateway (the host as seen from
+# a container) 172.28.0.1 (see docker-compose.prod.yml, networks: trinity-agent). Adjust the defines if you
+# changed TRINITY_* networking.
+#
+# What it enforces
+#   1. Agent -> this host: only the TCP ports listed in HOST_PORTS, on the bridge gateway address. Every other
+#      host port (SSH, admin UIs, databases, file shares, the host's LAN address) is dropped.
+#   2. Agent -> internet: allowed.
+#   3. Agent -> private space: dropped. RFC1918, CGNAT/VPN 100.64.0.0/10, link-local 169.254.0.0/16 (this includes
+#      the 169.254.169.254 cloud-metadata address) and the LAN placeholder 192.0.2.0/24.
+#   4. Agent <-> agent and agent <-> platform containers on the same bridge keep working.
+#
+# Separate table: this file only creates `table inet homeserver_agents`. Load it with `nft -f`, remove it with
+# `nft delete table inet homeserver_agents`. No other table is edited, but a drop here is final for the packet, so
+# this table does change what reaches the host: it matches IPv4 packets from AGENT_NET only, and every other packet
+# (other IPv4 sources, all IPv6) returns at the first rule of each chain.
+#
+# Coexisting with Docker
+#   Docker (iptables-nft or nft backend) installs its own FORWARD rules at hook priority 0 (filter). Netfilter runs
+#   every base chain on a hook, lowest priority number first, and a DROP in any of them is final; an ACCEPT only ends
+#   the chain it is in. Both chains below therefore sit at priority -10, ahead of Docker's priority-0 chains:
+#     - our drops win before Docker's "accept to anywhere" rule for container traffic can matter;
+#     - our accepts do not bypass anything, Docker's and your own chains still run after them.
+#   Docker's NAT runs at its own hooks (prerouting dstnat -100). A container reaching another container through a
+#   published port is already DNAT'd when it reaches the forward hook, so the rules below see the real destination.
+#   Do NOT use priority 0 or higher here: Docker may flush and rewrite its chains and the ordering becomes a race.
+#
+# IPv6: Docker leaves IPv6 off on this bridge by default. Both chains return on any non-IPv4 packet first, so IPv6
+# is neither filtered nor broken by this table. If you enable IPv6 on the bridge, add ip6 rules for it before
+# relying on this fence: as written, agent IPv6 traffic is not fenced.
+
+# --- edit these -------------------------------------------------------------------------------------------------
+define AGENT_NET   = 172.28.0.0/16        # the agent bridge subnet
+define HOST_GW     = 172.28.0.1           # the host, as agents see it
+define PORT_GATEWAY = 8780                # example: a local gateway service agents call
+define PORT_BROKER  = 8790                # example: a local API broker (credentials stay on the host)
+# define PORT_EXTRA  = 9000               # optional: uncomment, then add $PORT_EXTRA to HOST_PORTS below
+define HOST_PORTS  = { $PORT_GATEWAY, $PORT_BROKER }
+
+# Resolver the container engine forwards DNS to (if it is on your LAN, agents need this one exception).
+# Leave as the placeholder and remove the DNS rule below if your resolver is public or on the host.
+define LAN_DNS     = 192.0.2.1
+
+# Ranges agents must never reach (the LAN placeholder is listed explicitly even though 192.0.2.0/24 is documentation
+# space; replace it with your real LAN).
+define PRIVATE_NETS = {
+    10.0.0.0/8,
+    172.16.0.0/12,
+    192.168.0.0/16,
+    100.64.0.0/10,
+    169.254.0.0/16,
+    192.0.2.0/24
+}
+# -----------------------------------------------------------------------------------------------------------------
+
+table inet homeserver_agents {
+
+  # Traffic addressed to the host itself (not routed through it).
+  chain input {
+    type filter hook input priority -10; policy accept;
+
+    # IPv4 only. In an inet table an `ip saddr` rule never matches an IPv6 packet, so without this line every
+    # IPv6 packet would reach the drop below (the host would lose neighbour discovery, router adverts, DHCPv6, SSH).
+    meta nfproto != ipv4 return
+    # Only agent sources are touched; everything else falls through to the host's own rules.
+    ip saddr != $AGENT_NET return
+
+    ct state established,related accept
+    # Allow ping to the gateway for diagnostics.
+    ip daddr $HOST_GW icmp type echo-request accept
+    # The explicit allow-list.
+    ip daddr $HOST_GW tcp dport $HOST_PORTS accept
+    # Everything else an agent sends to the host: counted, then dropped.
+    counter drop
+  }
+
+  # Traffic routed through the host (agent -> internet, agent -> other networks).
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+
+    # IPv4 only (see the input chain).
+    meta nfproto != ipv4 return
+
+    # Replies to connections an agent opened. (Connections opened TOWARD an agent are not covered here.)
+    ct state established,related accept
+
+    # Agents only: traffic from other sources is not our business.
+    ip saddr != $AGENT_NET return
+
+    # Same bridge (agent <-> agent, agent <-> platform containers on this network). Matters if br_netfilter
+    # sends bridged frames through this hook.
+    ip daddr $AGENT_NET accept
+
+    # The one LAN exception: DNS to the resolver the engine forwards to. Delete if not needed.
+    ip daddr $LAN_DNS meta l4proto { tcp, udp } th dport 53 accept
+
+    # Optional extra exception, e.g. one service published on another bridge. Example, commented:
+    # ip daddr 198.51.100.40 tcp dport 8800 accept
+
+    # Private, VPN/CGNAT, link-local and LAN space: counted, then dropped.
+    ip daddr $PRIVATE_NETS counter drop
+
+    # Anything left is the public internet: falls through to Docker's own rules, which allow it.
+  }
+}

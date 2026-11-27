@@ -1,0 +1,51 @@
+[Unit]
+Description=Egress gateway for agent containers (token, ACL, approval for writes)
+After=network-online.target
+Wants=network-online.target
+# Writes-only kill switch: /etc/homeserver/gateway.disable (checked on every call, no restart needed).
+# To stop the whole service instead, use: systemctl stop hs-gateway
+
+[Service]
+Type=simple
+# Listen on the agent bridge gateway address so containers reach it at 172.28.0.1.
+Environment=GATEWAY_BIND=172.28.0.1
+Environment=GATEWAY_PORT=8780
+Environment=GATEWAY_TOKENS=/etc/homeserver/gateway/tokens
+Environment=GATEWAY_ACTIONS=/etc/homeserver/gateway/actions.json
+Environment=GATEWAY_ACL=/etc/homeserver/gateway/acl.json
+Environment=GATEWAY_LEDGER=/var/lib/homeserver/gateway/used.json
+Environment=GATEWAY_PLANS=/var/lib/homeserver/gateway/plans.json
+Environment=TRINITY_URL=http://127.0.0.1:8000
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Root-only credential files are copied into a private per-service directory ($CREDENTIALS_DIRECTORY,
+# which gateway.py uses as GATEWAY_CREDS). Add one line per file named by an action's credential.ref.
+LoadCredential=weather-key:/etc/homeserver/gateway/creds/weather-key
+LoadCredential=lights-token:/etc/homeserver/gateway/creds/lights-token
+LoadCredential=door-key:/etc/homeserver/gateway/creds/door-key
+# Token the gateway uses to raise and read operator-queue items in Trinity (an admin's user-scoped key; see README):
+LoadCredential=trinity-token:/etc/homeserver/gateway/trinity-token
+Environment=TRINITY_TOKEN_FILE=%d/trinity-token
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/hs-gateway
+Restart=on-failure
+RestartSec=5
+# Hardening. Only the used-approval ledger is writable.
+DynamicUser=yes
+StateDirectory=homeserver/gateway
+ReadWritePaths=/var/lib/homeserver/gateway
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

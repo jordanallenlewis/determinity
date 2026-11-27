@@ -1,0 +1,16 @@
+[Unit]
+Description=Socket for the review status signer
+ConditionPathExists=!/etc/homeserver/review-signer.disable
+
+[Socket]
+ListenStream=/run/review-signer.sock
+# Only root and members of this group can connect; the signer then maps SO_PEERCRED to a user name and
+# requires that name to be a caller in roles.json.
+SocketUser=root
+SocketGroup=review-signer-clients
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

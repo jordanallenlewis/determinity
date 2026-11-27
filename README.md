@@ -1,3 +1,52 @@
+<!-- Determinity: fork section. Everything from the divider down is upstream's README, unchanged. -->
+
+# Determinity: a hardened home-server layer for Trinity
+
+[![Fork of abilityai/trinity](https://img.shields.io/badge/fork%20of-abilityai%2Ftrinity-blue?logo=github)](https://github.com/abilityai/trinity)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
+**Determinity is a fork of [Trinity](https://github.com/abilityai/trinity) by [Ability.ai](https://www.ability.ai/trinity) (Apache 2.0).**
+For the platform itself, its documentation and its support, go upstream: [github.com/abilityai/trinity](https://github.com/abilityai/trinity) and [docs.ability.ai](https://docs.ability.ai). This fork adds a layer around Trinity. It does not replace it.
+
+## Why I forked it
+
+I run about 18 Claude Code agents on one mini PC at home. I wanted hard, deterministic boundaries around them: rules enforced by code the agents cannot change, not by instructions they are asked to follow. I also needed hardening for a single server on a home network, and that work doesn't belong upstream as it stands. On day one, during a smoke test, an agent changed my real thermostat from 79 to 78 degrees, because the approval lived in its instructions and not in the path the call took. That is why every check in this fork lives in code.
+
+The name is deterministic + Trinity.
+
+## What's different
+
+| Area | Upstream Trinity | Determinity |
+|---|---|---|
+| [Gateway](homeserver/gateway/) | Agents call devices, accounts and APIs directly, with the credentials and MCP servers you give them. | A gateway holds those credentials and offers named actions, each checked against the calling agent's allow-list. For a write to a device or account the gateway raises the Trinity operator-queue ask itself, in its own words with the exact parameters (secret ones, such as a door code, shown only as hidden), and the call goes through only after a person approves that ask, once. Anything it can't check is refused. |
+| [GitHub broker](homeserver/github-broker/) | An agent that works on GitHub holds a personal access token. | The broker holds the only GitHub credential. Each agent gets a token for named repositories and methods. It reads each push's ref updates before forwarding it and refuses any push to a protected branch, so a protected branch's history cannot be rewritten through it. It decides on the decoded, canonical REST path and forwards that path, refusing encoded slashes, dots and percent signs, dot and empty segments. On repositories the merge gate owns it refuses REST merges, commit-status and check writes at any path, adding or removing the merge or hold label, changing a pull request's base, and deleting workflow runs. It refuses any write whose issue or pull request number is not plain digits (GitHub reads `7abc` as 7) or whose route name has a suffix (`merge.json`). Everywhere it refuses `update-branch`, approving a run's deployments, pull requests whose head is a protected branch, query strings on writes and repository administration writes. It will not start on a policy that leaves the merge-gate list out, and an edit that does not load stops every call until it is fixed. Its GitHub token must not have the Workflows permission, but that is not the whole stop: code an existing workflow runs from the branch (a test script, a Makefile, a local action) can post a required check name wherever the job token can write checks, so the stop is a signed lead review of the head plus job tokens without `checks: write` (or `check_app_ids` pinned to an app that is not GitHub Actions). |
+| Signed reviews and the merge gate ([signer](homeserver/review-signer/), [merge gate](homeserver/merge-gate/)) | Review and merge policy is up to you and GitHub. | Reviewers sign their verdict as a commit status, through a signer that identifies its caller from the socket and never from the request. A merge script merges a pull request only when it has the merge label, green required checks (green only through a check run; a commit status can block but never pass a check) and the review statuses its tier needs, counted only when posted by the signer's account. The signer must have its own GitHub account that no other token on the host belongs to; the gate refuses to merge when the signer's login is its own or the broker's. Every commit's author and committer email must be on an allowed list (self-declared, not a signature check). On the repositories the gate owns, agents cannot merge through the broker; keep GitHub branch protection on for everything else. |
+| [Hardened agent image](homeserver/agent-image/) | The agent user has passwordless `sudo`, which the start-up script uses. | A derived image with no general `sudo`: only the start-up script's exact root commands are allowed, with no way to pass environment variables to them, and the start-up hooks read the container's own environment once per start. The build fails if upstream changes those lines. |
+| [Agent firewall](homeserver/firewall/) | Agent containers get the outbound network access of a normal Docker bridge. | An nftables table lets the agent bridge reach the internet and a short list of host ports (the gateway and the broker). It drops RFC 1918, CGNAT, link-local and every other host port. It filters agent IPv4 only and leaves IPv6 alone (keep IPv6 off on the agent bridge). |
+| [Caretaker, ops desk and capguard](homeserver/ops/) | Health checks, monitoring and an Operations queue of platform notices. Acting on them is up to you. | systemd timers with no model in them. The caretaker restarts stopped agents and reports stuck runs and failed schedules. The ops desk applies plain rules to the operator queue to resolve, route or keep each item for a person, and never answers an approval or a gate. Capguard pauses optional schedules when a week's run cost passes a budget, and restores only the ones it paused. |
+| [Stuck-threshold patch](homeserver/patches/) | The business health check calls a run stuck after a fixed 30 minutes and ignores the configured `stuck_execution_threshold` (upstream `main`, 2026-11-24). | A patch applied when the backend starts makes the check honour the setting. It does nothing once upstream changes those lines. |
+| [Caddy and sign-in gate](homeserver/caddy/) | The platform serves its web UI and API with its own login. | Caddy terminates TLS in front of the platform, admits only allowed address ranges, and puts a forward-auth sign-in gate (TinyAuth) before Trinity's own login. |
+| CI image build and upstream sync ([images](.github/workflows/hq-images.yml), [sync](.github/workflows/hq-upstream-sync.yml)) | Upstream is the source and publishes its own releases. | Every push to `hq` builds the four platform images and publishes them to this fork's GHCR namespace. A daily job merges upstream's latest release (see below). |
+
+## How it tracks upstream
+
+- **A daily sync.** [`hq-upstream-sync.yml`](.github/workflows/hq-upstream-sync.yml) merges upstream's latest release tag into `hq`, the default branch. Before it pushes, it gates the merge on a frontend build and a backend compile. If the merge conflicts or the gate fails, it opens a pull request for me to fix and pushes nothing.
+- **Upstream files stay as upstream wrote them.** There are three exceptions: this section of the README, the lines added at the end of `NOTICE`, and a UI fix from upstream [#4669](https://github.com/abilityai/trinity/pull/4669). Upstream has already merged that fix, and the sync drops it here once a release includes it.
+- **Everything Determinity adds lives under [`homeserver/`](homeserver/)**, plus the two `hq-*` workflows. Upstream has no such folder, so the sync can't conflict there.
+
+## The write-up
+
+For how the whole setup is built and run, step by step, with what went wrong along the way, see [Self-hosted AI agent platform: a Trinity setup guide](https://jordanallenlewis.com/posts/trinity-ai-agents-setup-guide?utm_source=github&utm_medium=readme&utm_campaign=determinity&utm_content=why-section).
+
+## Status and support
+
+This is a personal project, shared as-is, with no warranty (see [LICENSE](LICENSE), sections 7 and 8). Issues about anything under `homeserver/` are welcome here. For Trinity itself, use [upstream's issues](https://github.com/abilityai/trinity/issues) and [docs](https://docs.ability.ai).
+
+---
+
+<sub>Below this line is upstream Trinity's README, unchanged.</sub>
+
+
 <p align="center">
   <a href="https://www.ability.ai/trinity">
     <picture>

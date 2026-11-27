@@ -1,0 +1,30 @@
+[Unit]
+Description=Caretaker: no-LLM health loop for a Trinity fleet
+After=network-online.target
+Wants=network-online.target
+# Kill switch: touch /etc/homeserver/caretaker.disable to make this a no-op.
+ConditionPathExists=!/etc/homeserver/caretaker.disable
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hs-caretaker
+Environment=TRINITY_URL=http://127.0.0.1:8000
+# The token stays root-only (0600) and is handed to the service as a credential;
+# the script reads $CREDENTIALS_DIRECTORY/trinity-token.
+LoadCredential=trinity-token:/etc/homeserver/caretaker/token
+DynamicUser=yes
+StateDirectory=homeserver/caretaker
+ConfigurationDirectory=homeserver/caretaker
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+TimeoutStartSec=120

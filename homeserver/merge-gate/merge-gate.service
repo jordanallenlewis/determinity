@@ -1,0 +1,33 @@
+[Unit]
+Description=Merge gate (one pass)
+Documentation=file:///usr/local/share/doc/homeserver/merge-gate/README.md
+After=network-online.target
+Wants=network-online.target
+# Kill switch: this file turns every run into a no-op.
+ConditionPathExists=!/etc/homeserver/merge-gate.disable
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hs-merge-gate --once
+# Root-only token file handed to the service as a credential; the process never needs root.
+LoadCredential=github-token:/etc/homeserver/merge-gate/github-token
+Environment=MERGE_GATE_TOKEN_FILE=%d/github-token
+Environment=MERGE_GATE_CONFIG=/etc/homeserver/merge-gate/config.json
+DynamicUser=yes
+StateDirectory=homeserver/merge-gate
+Environment=MERGE_GATE_STATE=/var/lib/homeserver/merge-gate/state.json
+TimeoutStartSec=120
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

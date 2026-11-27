@@ -1,0 +1,72 @@
+# Caddyfile.example - Trinity web UI on the home network only, behind a password + TOTP sign-in (TinyAuth).
+#
+# Assumes Trinity's own .env has FRONTEND_BIND_ADDRESS=127.0.0.1 and FRONTEND_PORT=8081, so the bundled nginx
+# (docker-compose.prod.yml, service "frontend") is reachable only from this host, and Caddy owns ports 80/443.
+#
+# Trinity's own paths (from src/frontend/nginx-server.conf):
+#   /api/                  backend REST + SSE; the web UI uses it with a session token
+#   /ws                    backend WebSocket (browser live updates)
+#   /mcp                   MCP server (src/mcp-server); clients send a Trinity API key as a bearer token
+#   /a2a/                  agent-to-agent server; carries its own token
+#   /.well-known/aauth-*   discovery documents, no secrets
+#   /health                static "healthy" from nginx
+# Agent containers never go through this proxy (they talk to the backend and MCP server on Docker's network).
+#
+# The gate is the line `import /etc/caddy/trinity-gate.caddy`. `hs-trinity-gate on|off` rewrites that one file and
+# reloads Caddy. When it is off the file holds only a comment, and Trinity's own login still applies.
+
+# Allowed client networks. 192.0.2.0/24 is a placeholder for your LAN; 100.64.0.0/10 is the CGNAT/VPN range.
+(home_only) {
+	@outside not remote_ip 192.0.2.0/24 100.64.0.0/10
+	respond @outside "forbidden" 403
+}
+
+# Paths that carry their own token (or hold nothing private) and so skip the sign-in page.
+# A bearer-token client cannot answer a TOTP prompt.
+(gate_bypass) {
+	@open path /health /mcp /mcp/*
+	# Uncomment only if you use these from outside the browser:
+	#   @open path /health /mcp /mcp/* /a2a/* /.well-known/aauth-*
+}
+
+# --- the sign-in service itself ------------------------------------------------------------------------------
+auth.example.com {
+	# Certificates: a LAN-only name cannot use the HTTP challenge. Use `tls internal` (Caddy's own CA, clients must
+	# trust it) or a DNS-challenge `tls { dns <provider> ... }` block with a token from the environment.
+	tls internal
+	# `route` runs directives exactly in the order written, so the 403 is decided before anything is proxied.
+	route {
+		import home_only
+		reverse_proxy 127.0.0.1:8783
+	}
+}
+
+# --- Trinity ----------------------------------------------------------------------------------------------
+trinity.example.com {
+	tls internal
+	route {
+		# 1. Wrong network: 403, nothing else is evaluated.
+		import home_only
+		import gate_bypass
+
+		# 2. Bearer-token paths go straight to Trinity, which checks the token.
+		handle @open {
+			reverse_proxy 127.0.0.1:8081
+		}
+
+		# 3. Everything else: the sign-in gate first. A browser without a valid session is redirected to
+		#    auth.example.com; an unsigned request never reaches Trinity.
+		handle {
+			route {
+				import /etc/caddy/trinity-gate.caddy
+				reverse_proxy 127.0.0.1:8081
+			}
+		}
+	}
+}
+
+# Programmatic /api/ clients (scripts with a Trinity token) are NOT bypassed on purpose: the backend has a few
+# unauthenticated /api/auth/* routes, and a bypass would expose them to the whole LAN. If you need it, run such
+# clients on the Docker network instead, or add a matcher such as
+#     @api_token { path /api/* ; header Authorization "Bearer *" }
+# to gate_bypass, accepting that trade-off.

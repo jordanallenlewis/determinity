@@ -1,0 +1,4 @@
+{
+  "agent-a": ["weather.read", "lights.set"],
+  "agent-b": ["weather.read"]
+}

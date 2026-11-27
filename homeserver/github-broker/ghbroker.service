@@ -1,0 +1,39 @@
+[Unit]
+Description=GitHub broker for agent containers
+After=network-online.target
+Wants=network-online.target
+# Kill switch: touching this file makes the service refuse to start.
+ConditionPathExists=!/etc/homeserver/ghbroker.disable
+
+[Service]
+Type=simple
+# Listen on the agent bridge gateway address so containers reach it at 172.28.0.1.
+Environment=GHBROKER_BIND=172.28.0.1
+Environment=GHBROKER_PORT=8790
+Environment=GHBROKER_TOKENS=/etc/homeserver/ghbroker/tokens
+Environment=GHBROKER_POLICY=/etc/homeserver/ghbroker/policy.json
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/hs-ghbroker
+Restart=on-failure
+RestartSec=5
+# Hardening. The service reads its config and writes nothing to disk (logs go to journald).
+DynamicUser=yes
+LoadCredential=github-token:/etc/homeserver/ghbroker/github-token
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+# With DynamicUser the root-only token file is handed over as a credential (%d = its directory):
+Environment=GHBROKER_TOKEN_FILE=%d/github-token
+
+[Install]
+WantedBy=multi-user.target

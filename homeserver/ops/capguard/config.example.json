@@ -1,0 +1,8 @@
+{
+  "act": false,
+  "weekly_budget_usd": 500.0,
+  "warn_pct": 70,
+  "pause_pct": 90,
+  "restore_pct": 75,
+  "never_pause": ["agent-a", "reviewer-lead"]
+}

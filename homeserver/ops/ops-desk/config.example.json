@@ -1,0 +1,5 @@
+{
+  "act": false,
+  "allowed_verdicts": ["auto-resolve"],
+  "max_actions_per_run": 20
+}

@@ -1,0 +1,32 @@
+{
+  "_comment": "First matching rule wins. match keys: type, priority, agent, title_regex, min_age_minutes. verdict: auto-resolve | route | keep-for-human. Approval/gated items are never touched, whatever is written here.",
+  "rules": [
+    {
+      "name": "old-low-alerts",
+      "match": {"type": "alert", "priority": "low", "min_age_minutes": 1440},
+      "verdict": "auto-resolve",
+      "action": "cancel",
+      "reason": "low-priority alert older than a day, closed by triage rule"
+    },
+    {
+      "name": "routine-heartbeat-notices",
+      "match": {"title_regex": "(?i)^(heartbeat|daily summary)"},
+      "verdict": "auto-resolve",
+      "action": "cancel",
+      "reason": "routine notice, no decision needed"
+    },
+    {
+      "name": "credential-asks-to-admin",
+      "match": {"type": "credential"},
+      "verdict": "route",
+      "to": "admin",
+      "reason": "credential requests go to the admin seat"
+    },
+    {
+      "name": "everything-urgent-stays",
+      "match": {"priority": "urgent"},
+      "verdict": "keep-for-human",
+      "reason": "urgent items are for a person"
+    }
+  ]
+}

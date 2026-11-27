@@ -1,0 +1,24 @@
+# tinyauth.compose.example.yml - the sign-in service (TinyAuth) for hs-trinity-gate.
+# Run: docker compose -f tinyauth.compose.example.yml up -d   (after `hs-trinity-gate init`)
+#
+# No secret is written in this file or in the env file. The only secret is the users file, a root-owned file
+# bind-mounted read-only; it is created by `hs-trinity-gate init`.
+services:
+  tinyauth:
+    # Pinned tag, never :latest. Check the project's release notes before bumping; the TINYAUTH_* names in
+    # tinyauth.env.example follow this major version.
+    image: ghcr.io/tinyauthapp/tinyauth:v5.2.0
+    container_name: trinity-gate
+    restart: unless-stopped
+    user: "8783:8783"            # matches HS_GATE_UID in hs-trinity-gate (owner group of the users file)
+    network_mode: host           # listens on 127.0.0.1:8783 only (TINYAUTH_SERVER_ADDRESS)
+    env_file:
+      - /etc/homeserver/trinity-gate/tinyauth.env
+    volumes:
+      - /var/lib/homeserver/trinity-gate:/data
+      - /etc/homeserver/trinity-gate/users:/run/gate/users:ro
+    mem_limit: 128m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

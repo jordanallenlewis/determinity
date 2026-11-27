@@ -1,0 +1,164 @@
+#!/usr/bin/python3 -I
+"""review-signer: posts a GitHub commit status `review/<role>` on behalf of a trusted caller.
+
+Why a separate root-side piece: the reviewers run as unprivileged local users and must
+not hold the GitHub token. systemd socket activation (review-signer.socket, Accept=yes) starts
+one instance of this program per connection, with the connection on stdin/stdout.
+
+Protocol: one JSON line in, one JSON line out ({"ok": bool, "msg": str}).
+  in:  {"repo", "pr", "sha", "role", "verdict", "findings_high", "findings_total"?}
+The caller is the local user on the other end of the socket, read from SO_PEERCRED (uid) and mapped to a
+user name with the password database. Nothing in the request can set or change it: a "caller" field is
+optional, and a request whose "caller" differs from the socket peer is refused. roles.json is keyed by
+those user names and says which role each may sign with which verdicts; a role "lead" posts the commit
+status context "review/lead". The status text is neutral: counts only, never a name.
+
+Env: SIGNER_ROLES (/etc/homeserver/review-signer/roles.json), SIGNER_TOKEN_FILE
+(/etc/homeserver/review-signer/github-token),
+SIGNER_API_BASE (https://api.github.com), SIGNER_DISABLE (/etc/homeserver/review-signer.disable).
+Flags: --dry-run prints the API call instead of making it; --help.
+"""
+import argparse
+import json
+import os
+import pwd
+import re
+import socket
+import struct
+import sys
+import urllib.request
+
+ENV = os.environ.get
+
+
+def cfg():
+    return {
+        "roles": ENV("SIGNER_ROLES", "/etc/homeserver/review-signer/roles.json"),
+        "token_file": ENV("SIGNER_TOKEN_FILE", "/etc/homeserver/review-signer/github-token"),
+        "api_base": ENV("SIGNER_API_BASE", "https://api.github.com").rstrip("/"),
+        "disable": ENV("SIGNER_DISABLE", "/etc/homeserver/review-signer.disable"),
+    }
+
+
+def describe(verdict, high, total):
+    """Return (state, neutral description). Anything unknown or errored is never 'success'."""
+    if verdict == "clean":
+        return "success", "no findings"
+    if verdict == "findings":
+        blocking = "none blocking" if high == 0 else "%d blocking" % high
+        return ("success" if high == 0 else "failure"), "%d findings, %s" % (total, blocking)
+    if verdict == "pass":
+        return "success", "checks passed"
+    if verdict == "fail":
+        return "failure", "checks failed"
+    return "error", "review incomplete"
+
+
+def build_call(req, roles, caller):
+    """Validate a request from the socket peer `caller` against roles; return (path, payload). Raises ValueError.
+    The caller always comes from the socket peer; a "caller" field in the request is only accepted if it agrees."""
+    if not isinstance(caller, str) or not caller:
+        raise ValueError("no caller identity")
+    if "caller" in req and req["caller"] != caller:
+        raise ValueError("request names a different caller than the connection")
+    role, verdict = req.get("role"), req.get("verdict")
+    if not all(isinstance(x, str) for x in (role, verdict)):
+        raise ValueError("role and verdict must be strings")
+    allowed = roles.get("callers", {}).get(caller, {}).get(role)
+    if allowed is None:
+        raise ValueError("caller may not sign this role")
+    if verdict not in allowed:
+        raise ValueError("verdict not allowed for this role")
+    repo, sha, pr = req.get("repo"), str(req.get("sha") or "").lower(), req.get("pr")
+    if not (isinstance(repo, str) and re.fullmatch(r"[\w.-]+/[\w.-]+", repo)) or ".." in repo.split("/"):
+        raise ValueError("bad repo")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("sha must be 40 hex characters")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+        raise ValueError("bad pr number")
+    high = req.get("findings_high", 0)
+    total = req.get("findings_total", high)
+    for n in (high, total):
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 100000:
+            raise ValueError("finding counts must be small non-negative integers")
+    state, text = describe(verdict, high, max(total, high))
+    return "/repos/%s/statuses/%s" % (repo, sha), {"state": state, "context": "review/" + role, "description": text[:140]}
+
+
+def post_status(base, path, payload, token):
+    """The one network call (tests replace it)."""
+    r = urllib.request.Request(base + path, data=json.dumps(payload).encode(), method="POST", headers={
+        "Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json", "User-Agent": "review-signer"})
+    with urllib.request.urlopen(r, timeout=15) as resp:
+        return resp.status
+
+
+def handle(line, c, roles, caller, dry_run=False, poster=post_status):
+    """Process one request line from the socket peer `caller`; return the reply dict."""
+    try:
+        req = json.loads(line)
+        if not isinstance(req, dict):
+            raise ValueError("request must be an object")
+        path, payload = build_call(req, roles, caller)
+    except (ValueError, TypeError) as exc:
+        return {"ok": False, "msg": "refused: %s" % exc}
+    if dry_run:
+        return {"ok": True, "msg": "dry-run: POST %s%s %s" % (c["api_base"], path, json.dumps(payload))}
+    try:
+        with open(c["token_file"], encoding="utf-8") as fh:
+            token = fh.read().strip()
+    except OSError:
+        return {"ok": False, "msg": "no GitHub token configured"}
+    try:
+        status = poster(c["api_base"], path, payload, token)
+    except Exception as exc:
+        return {"ok": False, "msg": "GitHub call failed (%s)" % type(exc).__name__}
+    return {"ok": status in (200, 201), "msg": "status %s posted" % payload["context"] if status in (200, 201) else "GitHub answered %s" % status}
+
+
+def peer_uid(fd=0):
+    s = socket.socket(fileno=os.dup(fd))
+    try:
+        _, uid, _ = struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        return uid
+    finally:
+        s.close()
+
+
+def caller_from_peer(fd=0, uid_of=None, name_of=None):
+    """User name of the process on the other end of the socket. Raises OSError/KeyError/struct.error if unknown."""
+    uid_of = uid_of or peer_uid  # looked up at call time, not bound at definition
+    name_of = name_of or (lambda uid: pwd.getpwuid(uid).pw_name)
+    return name_of(uid_of(fd))
+
+
+def reply(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Post a neutral review/<role> commit status for a trusted caller.")
+    ap.add_argument("--dry-run", action="store_true", help="print the API call instead of making it")
+    args = ap.parse_args(argv)
+    c = cfg()
+    if os.path.exists(c["disable"]):
+        return reply({"ok": False, "msg": "signing is switched off"})
+    try:
+        caller = caller_from_peer()
+    except (OSError, KeyError, struct.error):
+        return reply({"ok": False, "msg": "cannot identify the caller"})  # fail closed
+    try:
+        with open(c["roles"], encoding="utf-8") as fh:
+            roles = json.load(fh)
+    except (OSError, ValueError):
+        return reply({"ok": False, "msg": "roles file unreadable"})
+    if caller not in roles.get("callers", {}):
+        return reply({"ok": False, "msg": "caller not allowed"})
+    print("signer: request from %s" % caller, file=sys.stderr)
+    reply(handle(sys.stdin.readline(4096), c, roles, caller, args.dry_run))
+
+
+if __name__ == "__main__":
+    main()

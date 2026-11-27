@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""hs-capguard: a usage/budget guard for a Trinity fleet, no LLM.
+
+CONCEPT SCRIPT / STARTING POINT. Small on purpose; read it, then adapt it.
+
+Each run it reads the fleet's spend over a rolling 7 days, compares it with a
+configured weekly budget, and:
+
+  * at or above `pause_pct`   : disables every enabled schedule of every agent
+                                that is not on the `never_pause` list, and
+                                remembers exactly which ones it disabled;
+  * at or below `restore_pct` : re-enables only the schedules in that ledger;
+  * in between                : changes nothing (hysteresis, so it does not flap).
+
+It never touches a schedule it did not pause itself: if a person has already
+re-enabled one, or deleted it, the entry is simply dropped from the ledger.
+Dry-run is the default; set "act": true in the config to make changes.
+Unreadable usage, a bad budget or a missing token fails closed (no changes).
+
+"Spend" here is the `cost` Trinity records on executions. If your install has
+no cost data, every reading is 0 and the guard never pauses anything.
+
+Trinity endpoints used (src/backend/routers/):
+  GET  /api/ops/fleet/status                      ops.py:55     agent names
+  GET  /api/executions/stats?hours=168[&agent=]   executions.py:64  total_cost
+  GET  /api/ops/schedules                         ops.py:177    all schedules
+  POST /api/agents/{name}/schedules/{id}/disable  schedules.py:589
+  POST /api/agents/{name}/schedules/{id}/enable   schedules.py:564
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+NAME = "capguard"
+CONF_DIR = os.environ.get("HS_CAPGUARD_DIR", "/etc/homeserver/capguard")
+STATE_DIR = os.environ.get("HS_CAPGUARD_STATE_DIR", "/var/lib/homeserver/capguard")
+KILL_SWITCH = os.environ.get("HS_CAPGUARD_KILL", "/etc/homeserver/capguard.disable")
+DEFAULTS = {
+    "act": False,
+    "weekly_budget_usd": 0.0,   # must be > 0, otherwise the guard fails closed
+    "warn_pct": 70.0,           # logged only
+    "pause_pct": 90.0,
+    "restore_pct": 75.0,        # must be below pause_pct
+    "never_pause": [],          # agents whose schedules are never touched
+}
+
+
+def log(msg):
+    print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {NAME}: {msg}", flush=True)
+
+
+class Api:
+    def __init__(self, base, token_file):
+        self.base = base.rstrip("/")
+        with open(token_file) as fh:
+            self.token = fh.read().strip()
+        if not self.token:
+            raise RuntimeError("token file is empty")
+
+    def call(self, method, path, params=None, body=None):
+        url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+
+# ---- pure bookkeeping (unit-tested in test_capguard.py) ----------------------------
+
+def decide(pct, have_paused, cfg):
+    """'pause' | 'restore' | 'hold'. Hysteresis between restore_pct and pause_pct."""
+    if pct >= cfg["pause_pct"]:
+        return "pause"
+    if pct <= cfg["restore_pct"] and have_paused:
+        return "restore"
+    return "hold"
+
+
+def plan_pause(schedules, never_pause, ledger):
+    """Enabled schedules of agents not on the allowlist and not already ours."""
+    return [s for s in schedules
+            if s["enabled"] and s["agent_name"] not in never_pause and s["id"] not in ledger]
+
+
+def plan_restore(ledger, schedules):
+    """Split the ledger into (to_enable, to_forget).
+
+    to_enable: still disabled, so we undo our own pause.
+    to_forget: gone, or enabled again by someone else; leave it alone."""
+    by_id = {s["id"]: s for s in schedules}
+    enable, forget = [], []
+    for sid, entry in ledger.items():
+        cur = by_id.get(sid)
+        if cur is not None and not cur["enabled"]:
+            enable.append((sid, entry))
+        else:
+            forget.append(sid)
+    return enable, forget
+
+
+def validate(cfg):
+    if not cfg["weekly_budget_usd"] > 0:
+        raise ValueError("weekly_budget_usd must be > 0")
+    if not (0 < cfg["restore_pct"] < cfg["pause_pct"]):
+        raise ValueError("need 0 < restore_pct < pause_pct")
+
+
+# ---- state ----------------------------------------------------------------------------
+
+def load_state(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {"paused": {}}
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+# ---- the run ----------------------------------------------------------------------------
+
+def read_usage(api):
+    """(fleet_total_usd, {agent: usd}) over the last 168 hours."""
+    total = float(api.call("GET", "/api/executions/stats", {"hours": 168})["total_cost"])
+    per = {}
+    for a in api.call("GET", "/api/ops/fleet/status").get("agents", []):
+        st = api.call("GET", "/api/executions/stats", {"hours": 168, "agent": a["name"]})
+        per[a["name"]] = float(st["total_cost"])
+    return total, per
+
+
+def set_schedule(api, sched, enable):
+    verb = "enable" if enable else "disable"
+    api.call("POST", f"/api/agents/{urllib.parse.quote(sched['agent_name'])}"
+                     f"/schedules/{urllib.parse.quote(sched['id'])}/{verb}")
+
+
+def run(cfg, api, state_path, now=None):
+    now_iso = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    validate(cfg)
+    act, state = bool(cfg["act"]), load_state(state_path)
+    ledger = state.setdefault("paused", {})
+
+    total, per = read_usage(api)
+    pct = round(total / cfg["weekly_budget_usd"] * 100, 1)
+    top = sorted(per.items(), key=lambda kv: -kv[1])[:5]
+    log(f"usage {total:.2f} of {cfg['weekly_budget_usd']:.2f} ({pct}%), top: {top}")
+    if pct >= cfg["warn_pct"]:
+        log(f"WARN usage at or above warn_pct={cfg['warn_pct']}")
+
+    schedules = api.call("GET", "/api/ops/schedules").get("schedules", [])
+    action = decide(pct, bool(ledger), cfg)
+    if action == "pause":
+        for s in plan_pause(schedules, set(cfg["never_pause"]), ledger):
+            if not act:
+                log(f"DRY-RUN would pause {s['agent_name']}/{s['name']}")
+                continue
+            try:
+                set_schedule(api, s, False)
+                ledger[s["id"]] = {"agent": s["agent_name"], "name": s["name"], "paused_at": now_iso}
+                log(f"paused {s['agent_name']}/{s['name']}")
+            except urllib.error.HTTPError as exc:  # not recorded: we did not pause it
+                log(f"pause failed {s['agent_name']}/{s['name']}: HTTP {exc.code}")
+    elif action == "restore":
+        enable, forget = plan_restore(ledger, schedules)
+        for sid in forget:
+            log(f"forgetting {sid}: gone or already enabled by someone else")
+            if act:
+                ledger.pop(sid, None)
+        by_id = {s["id"]: s for s in schedules}
+        for sid, entry in enable:
+            if not act:
+                log(f"DRY-RUN would restore {entry['agent']}/{entry['name']}")
+                continue
+            try:
+                set_schedule(api, by_id[sid], True)
+                ledger.pop(sid)
+                log(f"restored {entry['agent']}/{entry['name']}")
+            except urllib.error.HTTPError as exc:  # stays in the ledger, retried next run
+                log(f"restore failed {entry['agent']}/{entry['name']}: HTTP {exc.code}")
+    state.update({"last_run": now_iso, "last_pct": pct, "last_action": action, "dry_run": not act})
+    save_state(state_path, state)
+    log(f"done: action={action} ledger={len(ledger)} dry_run={not act}")
+    return action
+
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    with open(path) as fh:
+        user = json.load(fh)
+    unknown = set(user) - set(DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown config keys: {sorted(unknown)}")
+    cfg.update(user)
+    validate(cfg)
+    return cfg
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Usage guard: pauses non-essential schedules over a "
+                                 "budget threshold and restores only those it paused. "
+                                 "Dry-run unless the config sets \"act\": true.")
+    ap.add_argument("--config", default=os.path.join(CONF_DIR, "config.json"))
+    ap.add_argument("--state", default=os.path.join(STATE_DIR, "state.json"))
+    ap.add_argument("--dry-run", action="store_true", help="force dry-run even if config says act")
+    args = ap.parse_args(argv)
+    if os.path.exists(KILL_SWITCH):
+        log(f"kill switch {KILL_SWITCH} present, doing nothing")
+        return 0
+    try:
+        cfg = load_config(args.config)
+        if args.dry_run:
+            cfg["act"] = False
+        creds = os.environ.get("CREDENTIALS_DIRECTORY")
+        token_file = os.environ.get("TRINITY_TOKEN_FILE") or (
+            os.path.join(creds, "trinity-token") if creds else os.path.join(CONF_DIR, "token"))
+        api = Api(os.environ.get("TRINITY_URL", "http://127.0.0.1:8000"), token_file)
+        run(cfg, api, args.state)
+        return 0
+    except (OSError, ValueError, KeyError, RuntimeError, urllib.error.URLError) as exc:
+        log(f"FAILED CLOSED: {type(exc).__name__}: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

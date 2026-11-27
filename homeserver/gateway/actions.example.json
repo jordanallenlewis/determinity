@@ -1,0 +1,39 @@
+{
+  "_comment": "Placeholders only. 'describe' (optional, write actions) is the plain sentence the approver reads; {param} placeholders are filled with the exact values. credential.ref names a root-only file under /etc/homeserver/gateway/creds/ (never the value). 'header' and 'prefix' say how the credential is sent. 'sensitive': true keeps param values out of the log. A param with 'secret': true is never sent to Trinity (the approver sees '(secret, not shown)'); a sensitive action that marks no param secret has every param treated as secret. Params used in the url go in the URL (percent-encoded); the rest of a non-GET call travel as a JSON body.",
+  "weather.read": {
+    "kind": "read",
+    "method": "GET",
+    "url": "https://api.example.com/v1/forecast?lat={lat}&lon={lon}",
+    "credential": {"ref": "weather-key", "header": "X-Api-Key", "prefix": ""},
+    "params": {
+      "lat": {"pattern": "-?[0-9]{1,2}(\\.[0-9]{1,5})?"},
+      "lon": {"pattern": "-?[0-9]{1,3}(\\.[0-9]{1,5})?"}
+    }
+  },
+  "lights.set": {
+    "kind": "write",
+    "method": "POST",
+    "url": "http://192.0.2.20/api/lights/{id}",
+    "credential": {"ref": "lights-token", "header": "Authorization", "prefix": "Bearer "},
+    "describe": "Turn light {id} {state}",
+    "max_per_hour": 20,
+    "params": {
+      "id": {"pattern": "[a-z0-9-]{1,32}"},
+      "state": {"pattern": "on|off"},
+      "brightness": {"pattern": "[0-9]{1,3}", "optional": true}
+    }
+  },
+  "door.unlock": {
+    "kind": "write",
+    "method": "POST",
+    "url": "http://198.51.100.30/api/door/{door}/unlock",
+    "credential": {"ref": "door-key", "header": "X-Auth", "prefix": ""},
+    "describe": "Unlock the {door} door",
+    "sensitive": true,
+    "max_per_hour": 3,
+    "params": {
+      "door": {"pattern": "front|garage"},
+      "code": {"pattern": "[0-9]{4,8}", "secret": true}
+    }
+  }
+}

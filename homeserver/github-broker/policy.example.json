@@ -1,0 +1,12 @@
+{
+  "protected_branches": ["release/*"],
+  "merge_gate_repos": ["OWNER/REPO"],
+  "merge_label": "automerge",
+  "hold_label": "hold",
+  "extra_message_patterns": ["^signed-off-by-bot:"],
+  "hourly_budget": {"default": 600, "agent-b": 200},
+  "agents": {
+    "agent-a": {"OWNER/REPO": "write", "OWNER/docs": "read"},
+    "agent-b": {"OWNER/REPO": "read"}
+  }
+}

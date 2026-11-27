@@ -1,0 +1,12 @@
+# Installed as /etc/sudoers.d/agent-image by the overlay Dockerfile.
+# These are exactly the privileged commands Trinity's startup.sh runs (the two
+# python hooks go through hs-root-hook). Anything else needs a password, and the
+# user has none. No SETENV and no env_keep: sudo's env_reset applies and the
+# caller cannot pass variables (`sudo VAR=x cmd` and `sudo -E` are refused).
+# hs-root-hook takes the hooks' input from the container's own environment.
+Defaults:developer env_reset, !setenv
+developer ALL=(root) NOPASSWD: /usr/local/sbin/hs-root-hook runtime-config
+developer ALL=(root) NOPASSWD: /usr/local/sbin/hs-root-hook routing-env
+developer ALL=(root) NOPASSWD: /usr/bin/mkdir -p /var/run/sshd
+developer ALL=(root) NOPASSWD: /usr/bin/chmod 0755 /var/run/sshd
+developer ALL=(root) NOPASSWD: /usr/sbin/sshd -D

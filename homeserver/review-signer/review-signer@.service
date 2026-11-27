@@ -1,0 +1,24 @@
+[Unit]
+Description=Review status signer (one instance per connection)
+
+[Service]
+# Root only because it reads the GitHub token file (mode 0600). Everything else is locked down.
+User=root
+StandardInput=socket
+StandardError=journal
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/hs-review-signer
+TimeoutStopSec=20
+RuntimeMaxSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=

@@ -1,0 +1,30 @@
+[Unit]
+Description=Capguard: usage guard for a Trinity fleet
+After=network-online.target
+Wants=network-online.target
+# Kill switch: touch /etc/homeserver/capguard.disable to make this a no-op.
+ConditionPathExists=!/etc/homeserver/capguard.disable
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hs-capguard
+Environment=TRINITY_URL=http://127.0.0.1:8000
+# The token stays root-only (0600) and is handed to the service as a credential;
+# the script reads $CREDENTIALS_DIRECTORY/trinity-token.
+LoadCredential=trinity-token:/etc/homeserver/capguard/token
+DynamicUser=yes
+StateDirectory=homeserver/capguard
+ConfigurationDirectory=homeserver/capguard
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+TimeoutStartSec=120

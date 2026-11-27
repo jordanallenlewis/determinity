@@ -1,0 +1,5 @@
+# Format: <sha256 hex of the agent's raw bearer token>  <agent name>
+# Make one:  T=$(openssl rand -hex 32); echo "$T" | tr -d '\n' | sha256sum | cut -d' ' -f1
+# Give $T to the agent (its hs-gh token file). Only the hash goes here. Hashes below are fake.
+0000000000000000000000000000000000000000000000000000000000000001  agent-a
+0000000000000000000000000000000000000000000000000000000000000002  agent-b

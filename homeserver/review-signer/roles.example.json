@@ -1,0 +1,6 @@
+{
+  "callers": {
+    "reviewer-lead": {"lead": ["clean", "findings", "error"]},
+    "reviewer-principal": {"principal": ["clean", "findings", "error"]}
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "act": false,
+  "should_run": ["agent-a", "agent-b"],
+  "ignore": [],
+  "max_restarts_per_hour": 3,
+  "stuck_minutes": 120,
+  "notify": false,
+  "notify_priority": "high"
+}

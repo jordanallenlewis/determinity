@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run docker compose for the Trinity stack with the home-server override.
+#   trinity ps | trinity up -d | trinity --profile otel up -d | trinity down
+# TRINITY_DIR is the checkout holding docker-compose.hosted.yml, .env and
+# docker-compose.box.yml (default /srv/trinity).
+TRINITY_DIR=${TRINITY_DIR:-/srv/trinity}
+cd "$TRINITY_DIR" || { echo "trinity: cannot cd to $TRINITY_DIR" >&2; exit 1; }
+exec docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"

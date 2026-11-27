@@ -1,0 +1,68 @@
+# Override for running Trinity on a single home server next to other services.
+#
+# Use it on top of upstream's pull-only file, only through the `trinity` wrapper
+# in this folder (or the equivalent command):
+#
+#   docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml <args>
+#
+# Needs Docker Compose 2.24 or newer (for the `!override` tag).
+# The memory numbers are examples for a 16 GB machine. Size them for yours.
+# Every service name below exists in upstream docker-compose.hosted.yml.
+
+services:
+  backend:
+    # Loopback only: a reverse proxy on the same host is the one way in.
+    # Upstream publishes 0.0.0.0:8000.
+    ports: !override
+      - "127.0.0.1:${BOX_BACKEND_PORT:-8000}:8000"
+    mem_limit: 4g          # example
+    memswap_limit: 5g      # example: 1g of swap on top of the memory limit
+    cpu_shares: 4096       # default is 1024: the platform wins CPU contention against agent workloads
+    # Patch hook: runs patches/stuck-threshold.py, then starts the original command.
+    # `|| true` keeps a failed patch from blocking startup. The doubled $$ stops
+    # compose from expanding it. Undo: delete these two keys and the mount, then
+    # `trinity up -d backend`.
+    volumes:
+      - ${BOX_PATCHES_DIR:-./patches}:/patches:ro
+    entrypoint: ["sh", "-c", "python /patches/stuck-threshold.py || true; exec \"$$@\"", "--"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    mem_limit: 256m        # example
+    # Its published ports are controlled by FRONTEND_BIND_ADDRESS in .env
+    # (set it to 127.0.0.1); see README.
+
+  redis:
+    mem_limit: 512m        # example
+
+  scheduler:
+    mem_limit: 512m        # example
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp-server:
+    ports: !override
+      - "127.0.0.1:${BOX_MCP_PORT:-18080}:8080"   # 8080 is commonly taken on a home server
+    mem_limit: 512m        # example
+
+  vector:
+    ports: !override
+      - "127.0.0.1:${BOX_VECTOR_PORT:-8686}:8686"
+    mem_limit: 512m        # example: raise it if the container sits near its limit
+
+  # Optional metrics collector. Off unless you pass `--profile otel`.
+  otel-collector:
+    profiles: ["otel"]
+    ports: !override
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:13133:13133"
+    mem_limit: 256m        # example
+
+  postgres:
+    mem_limit: 2g          # example
+    cpu_shares: 4096

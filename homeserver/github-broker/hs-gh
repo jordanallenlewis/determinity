@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# hs-gh: agent-side client for the GitHub broker. No GitHub token here, only the broker token.
+#   hs-gh api METHOD PATH [JSON]     REST call, e.g. hs-gh api GET /repos/OWNER/REPO/pulls
+#   hs-gh git-setup OWNER/REPO [DIR] clone through the broker; the setting lives in that clone only
+# Env: HS_GH_BROKER (default http://172.28.0.1:8790), HS_GH_TOKEN or HS_GH_TOKEN_FILE
+#      (default /etc/homeserver/hs-gh/token), HS_GH_DRY_RUN=1 or --dry-run prints instead of acting.
+set -euo pipefail
+
+BROKER="${HS_GH_BROKER:-http://172.28.0.1:8790}"
+TOKEN_FILE="${HS_GH_TOKEN_FILE:-/etc/homeserver/hs-gh/token}"
+DRY="${HS_GH_DRY_RUN:-0}"
+
+usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
+die() { echo "hs-gh: $*" >&2; exit 2; }
+
+[ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
+case "${1:-}" in -h|--help|"") usage; exit 0 ;; esac
+
+TOKEN="${HS_GH_TOKEN:-}"
+if [ -z "$TOKEN" ] && [ -r "$TOKEN_FILE" ]; then TOKEN="$(tr -d '\n' < "$TOKEN_FILE")"; fi
+[ -n "$TOKEN" ] || [ "$DRY" = 1 ] || die "no broker token (set HS_GH_TOKEN or HS_GH_TOKEN_FILE)"
+
+cmd="$1"; shift
+case "$cmd" in
+  api)
+    [ $# -ge 2 ] || die "usage: hs-gh api METHOD PATH [JSON]"
+    method="${1^^}"; path="$2"; json="${3:-}"
+    case "$path" in /*) ;; *) die "PATH must start with /" ;; esac
+    args=(-sS -X "$method" -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${TOKEN:-<token>}")
+    [ -n "$json" ] && args+=(-H "Content-Type: application/json" --data "$json")
+    if [ "$DRY" = 1 ]; then
+      echo "curl ${args[*]//Bearer*/Bearer <token>} $BROKER/gh$path"
+    else
+      curl "${args[@]}" "$BROKER/gh$path"
+    fi ;;
+  git-setup)
+    [ $# -ge 1 ] || die "usage: hs-gh git-setup OWNER/REPO [DIR]"
+    repo="$1"; dir="${2:-${repo#*/}}"
+    case "$repo" in */*) ;; *) die "repo must look like OWNER/REPO" ;; esac
+    opts=(-c "url.$BROKER/git/.insteadOf=https://github.com/"
+          -c "http.extraHeader=Authorization: Bearer $TOKEN"
+          -c "http.postBuffer=524288000")
+    if [ "$DRY" = 1 ]; then
+      echo "git clone <options: insteadOf $BROKER/git/, auth header, postBuffer> https://github.com/$repo.git $dir"
+    else
+      git clone "${opts[@]}" "https://github.com/$repo.git" "$dir"
+    fi ;;
+  *) usage; exit 2 ;;
+esac

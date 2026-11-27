@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""hs-ops-desk: rule-based triage of Trinity's operator queue, no LLM.
+
+CONCEPT SCRIPT / STARTING POINT. Small on purpose; read it, then adapt it.
+
+Reads pending operator-queue items, classifies each with the first matching
+rule from a JSON rules file, and gives one verdict:
+
+  auto-resolve    close the item (action "cancel" with a reason, or
+                  "respond" with one of the options the agent offered)
+  route           move the item with the admin readdress call ("rule" or "admin")
+  keep-for-human  do nothing; the item stays for a person
+
+Safety, in code and not only in config:
+  * an item of type "approval", or one that carries a gate/proposal, is
+    ALWAYS keep-for-human. No rule can override this.
+  * no matching rule means keep-for-human.
+  * a verdict is applied only if the config's "allowed_verdicts" lists it
+    and "act" is true. Dry-run is the default.
+  * at most "max_actions_per_run" changes per run.
+
+Trinity endpoints used (src/backend/routers/operator_queue.py):
+  GET  /api/operator-queue                   :235  list (status=pending, paged)
+  POST /api/operator-queue/{id}/cancel       :538  body {"reason"}
+  POST /api/operator-queue/{id}/respond      :410  body {"response"}
+  POST /api/operator-queue/{id}/readdress    :597  body {"to","reason"}
+respond and cancel are refused for machine keys (reject_non_person_principal),
+and readdress needs an admin person: the token must be a person's own key.
+There is no endpoint to attach a note to an item, so the one-line reason is
+sent where the API takes one (cancel, readdress) and for every item it is also
+appended to the decisions log. See README.md.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+NAME = "ops-desk"
+CONF_DIR = os.environ.get("HS_OPSDESK_DIR", "/etc/homeserver/ops-desk")
+STATE_DIR = os.environ.get("HS_OPSDESK_STATE_DIR", "/var/lib/homeserver/ops-desk")
+KILL_SWITCH = os.environ.get("HS_OPSDESK_KILL", "/etc/homeserver/ops-desk.disable")
+DEFAULTS = {"act": False, "allowed_verdicts": ["auto-resolve"], "max_actions_per_run": 20,
+            "rules": []}
+VERDICTS = ("auto-resolve", "route", "keep-for-human")
+KEEP = "keep-for-human"
+
+
+def log(msg):
+    print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {NAME}: {msg}", flush=True)
+
+
+class Api:
+    def __init__(self, base, token_file):
+        self.base = base.rstrip("/")
+        with open(token_file) as fh:
+            self.token = fh.read().strip()
+        if not self.token:
+            raise RuntimeError("token file is empty")
+
+    def call(self, method, path, params=None, body=None):
+        url = self.base + path + ("?" + urllib.parse.urlencode(params, doseq=True) if params else "")
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+
+# ---- classification (pure, unit-tested) -----------------------------------------
+
+def is_gated(item):
+    """Approval / gated items are for humans only, whatever the rules say."""
+    return (item.get("type") == "approval" or bool(item.get("gate"))
+            or bool(item.get("proposal")))
+
+
+def age_minutes(item, now):
+    try:
+        dt = datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        return 0
+    dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return (now - dt).total_seconds() / 60
+
+
+def rule_matches(rule, item, now):
+    m = rule.get("match", {})
+    if "type" in m and item.get("type") != m["type"]:
+        return False
+    if "priority" in m and item.get("priority") != m["priority"]:
+        return False
+    if "agent" in m and item.get("agent_name") != m["agent"]:
+        return False
+    if "title_regex" in m and not re.search(m["title_regex"], item.get("title") or ""):
+        return False
+    if "min_age_minutes" in m and age_minutes(item, now) < m["min_age_minutes"]:
+        return False
+    return True
+
+
+def classify(item, rules, allowed, now):
+    """Return (verdict, rule_or_None, reason). First matching rule wins."""
+    if is_gated(item):
+        return KEEP, None, "approval or gated item: humans only"
+    for rule in rules:
+        if not rule_matches(rule, item, now):
+            continue
+        verdict = rule["verdict"]
+        if verdict == KEEP:
+            return KEEP, rule, rule.get("reason", f"rule {rule['name']}: keep")
+        if verdict not in allowed:
+            return KEEP, rule, f"rule {rule['name']} says {verdict}, not allowed in config"
+        if rule.get("action") == "respond" and not offered(item, rule.get("response")):
+            return KEEP, rule, f"rule {rule['name']}: response is not one of the offered options"
+        return verdict, rule, rule.get("reason", f"rule {rule['name']}")
+    return KEEP, None, "no rule matched"
+
+
+def offered(item, response):
+    """True if `response` is one of the options the agent offered."""
+    values = set()
+    for opt in item.get("options") or []:
+        values.add(opt if isinstance(opt, str) else str(opt.get("value", opt.get("label", ""))))
+    return response is not None and response in values
+
+
+def validate_rules(rules):
+    for i, r in enumerate(rules):
+        if r.get("verdict") not in VERDICTS or "name" not in r:
+            raise ValueError(f"rule #{i}: needs name and verdict in {VERDICTS}")
+        if r["verdict"] == "route" and r.get("to", "rule") not in ("rule", "admin"):
+            raise ValueError(f"rule {r['name']}: route 'to' must be rule or admin")
+        if r["verdict"] == "auto-resolve" and r.get("action", "cancel") not in ("cancel", "respond"):
+            raise ValueError(f"rule {r['name']}: action must be cancel or respond")
+        if "title_regex" in r.get("match", {}):
+            re.compile(r["match"]["title_regex"])
+
+
+# ---- applying ---------------------------------------------------------------------
+
+def apply(api, item, verdict, rule):
+    """Perform one verdict. Returns the one-line reason that was sent."""
+    reason = (rule.get("reason") or f"handled by rule {rule['name']}")[:480]
+    base = f"/api/operator-queue/{urllib.parse.quote(item['id'])}"
+    if verdict == "route":
+        api.call("POST", base + "/readdress", body={"to": rule.get("to", "rule"), "reason": reason})
+    elif rule.get("action") == "respond":
+        api.call("POST", base + "/respond", body={"response": rule["response"]})
+    else:
+        api.call("POST", base + "/cancel", body={"reason": reason})
+    return reason
+
+
+def fetch_pending(api, page=100, max_items=1000):
+    items, offset = [], 0
+    while len(items) < max_items:
+        res = api.call("GET", "/api/operator-queue",
+                       {"status": "pending", "limit": page, "offset": offset})
+        items += res.get("items", [])
+        if not res.get("has_more"):
+            break
+        offset = res.get("next_offset") or offset + page
+    return items
+
+
+def run(cfg, api, decisions_path, now=None):
+    now = now or datetime.now(timezone.utc)
+    act, allowed = bool(cfg["act"]), set(cfg["allowed_verdicts"])
+    done, counts = 0, {}
+    lines = []
+    for item in fetch_pending(api):
+        verdict, rule, reason = classify(item, cfg["rules"], allowed, now)
+        outcome = "kept"
+        if verdict != KEEP:
+            if done >= cfg["max_actions_per_run"]:
+                outcome, reason = "kept", "per-run action cap reached"
+            elif not act:
+                outcome = f"dry-run: would {verdict}"
+            else:
+                try:
+                    reason = apply(api, item, verdict, rule)
+                    outcome, done = verdict, done + 1
+                except urllib.error.HTTPError as exc:
+                    outcome, reason = "failed", f"HTTP {exc.code}"
+        counts[outcome] = counts.get(outcome, 0) + 1
+        lines.append({"ts": now.isoformat(timespec="seconds"), "item": item["id"],
+                      "agent": item.get("agent_name"), "title": (item.get("title") or "")[:120],
+                      "verdict": verdict, "outcome": outcome, "reason": reason})
+        log(f"{item['id']} {verdict} -> {outcome}: {reason}")
+    if lines:
+        os.makedirs(os.path.dirname(decisions_path), exist_ok=True)
+        with open(decisions_path, "a") as fh:
+            fh.writelines(json.dumps(x) + "\n" for x in lines)
+    log(f"done: {sum(counts.values())} pending items, {counts}, dry_run={not act}")
+    return lines
+
+
+def load_config(path, rules_path):
+    cfg = dict(DEFAULTS)
+    with open(path) as fh:
+        user = json.load(fh)
+    unknown = set(user) - set(DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown config keys: {sorted(unknown)}")
+    cfg.update(user)
+    with open(rules_path) as fh:
+        cfg["rules"] = json.load(fh)["rules"]
+    validate_rules(cfg["rules"])
+    bad = set(cfg["allowed_verdicts"]) - {"auto-resolve", "route"}
+    if bad:
+        raise ValueError(f"allowed_verdicts may only list auto-resolve and route, got {sorted(bad)}")
+    return cfg
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Rule-based operator-queue triage. "
+                                 "Dry-run unless the config sets \"act\": true.")
+    ap.add_argument("--config", default=os.path.join(CONF_DIR, "config.json"))
+    ap.add_argument("--rules", default=os.path.join(CONF_DIR, "rules.json"))
+    ap.add_argument("--decisions", default=os.path.join(STATE_DIR, "decisions.jsonl"))
+    ap.add_argument("--dry-run", action="store_true", help="force dry-run even if config says act")
+    args = ap.parse_args(argv)
+    if os.path.exists(KILL_SWITCH):
+        log(f"kill switch {KILL_SWITCH} present, doing nothing")
+        return 0
+    try:
+        cfg = load_config(args.config, args.rules)
+        if args.dry_run:
+            cfg["act"] = False
+        creds = os.environ.get("CREDENTIALS_DIRECTORY")
+        token_file = os.environ.get("TRINITY_TOKEN_FILE") or (
+            os.path.join(creds, "trinity-token") if creds else os.path.join(CONF_DIR, "token"))
+        api = Api(os.environ.get("TRINITY_URL", "http://127.0.0.1:8000"), token_file)
+        run(cfg, api, args.decisions)
+        return 0
+    except (OSError, ValueError, KeyError, RuntimeError, re.error, urllib.error.URLError) as exc:
+        log(f"FAILED CLOSED: {type(exc).__name__}: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

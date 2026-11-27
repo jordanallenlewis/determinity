@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# hs-trinity-gate - switch the password + TOTP sign-in gate in front of the Trinity web UI.
+#
+#   init     create the sign-in user: prompts for a password (not echoed), generates a TOTP seed, writes the
+#            password HASH and the seed to root-only files. Shows the authenticator URI/QR once, on the terminal.
+#   on       Caddy asks the sign-in service before every Trinity page except the token-bearing paths.
+#   off      BREAK-GLASS: Caddy stops asking. Trinity's own login still applies. Needs only root on this host.
+#   status   files present, gate on/off, sign-in service health.
+#
+# Options: -n/--dry-run (print what would change, change nothing), -h/--help.
+# Fails closed: any error leaves the previous state in place. A kill-switch file is not needed; `off` is the switch.
+set -euo pipefail
+
+DIR=${HS_GATE_DIR:-/etc/homeserver/trinity-gate}          # root-only secrets
+SNIPPET=${HS_GATE_SNIPPET:-/etc/caddy/trinity-gate.caddy}  # the file Caddyfile imports
+USERNAME=${HS_GATE_USER:-admin}
+GATE_ADDR=${HS_GATE_ADDR:-127.0.0.1:8783}                  # where the sign-in service listens
+GATE_UID=${HS_GATE_UID:-8783}                              # uid the container runs as (reads `users` only)
+ISSUER=${HS_GATE_ISSUER:-Trinity}
+CADDYFILE=${HS_GATE_CADDYFILE:-/etc/caddy/Caddyfile}
+VALIDATE_CMD=${HS_GATE_VALIDATE_CMD:-caddy validate --config $CADDYFILE}
+RELOAD_CMD=${HS_GATE_RELOAD_CMD:-systemctl reload caddy}
+
+DRY=0
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; cat <<U
+
+Environment: HS_GATE_DIR HS_GATE_SNIPPET HS_GATE_USER HS_GATE_ADDR HS_GATE_UID HS_GATE_ISSUER
+             HS_GATE_CADDYFILE HS_GATE_VALIDATE_CMD HS_GATE_RELOAD_CMD
+Usage: hs-trinity-gate [-n] init|on|off|status
+U
+}
+die() { echo "hs-trinity-gate: $*" >&2; exit 1; }
+say() { echo "hs-trinity-gate: $*"; }
+need_root() { [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root"; }
+
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+CMD=${ARGS[0]:-status}
+
+# Write the Caddy snippet, validate, reload; restore the old snippet if Caddy refuses.
+apply_snippet() {   # $1 = new content
+  if [ "$DRY" = 1 ]; then say "dry-run: would write $SNIPPET:"; printf '%s\n' "$1"; return 0; fi
+  [ -w "$(dirname "$SNIPPET")" ] || die "cannot write $SNIPPET (run as root?)"
+  local old="" had=0
+  if [ -f "$SNIPPET" ]; then had=1; old=$(cat "$SNIPPET"); fi
+  printf '%s\n' "$1" > "$SNIPPET.new" && chmod 0644 "$SNIPPET.new" && mv "$SNIPPET.new" "$SNIPPET"
+  if $VALIDATE_CMD >/dev/null 2>&1 && $RELOAD_CMD >/dev/null 2>&1; then return 0; fi
+  if [ "$had" = 1 ]; then printf '%s\n' "$old" > "$SNIPPET"; else rm -f "$SNIPPET"; fi
+  die "Caddy refused the change; previous state kept"
+}
+
+case "$CMD" in
+  init)
+    need_root
+    [ -e "$DIR/users" ] && die "$DIR/users exists; refusing to overwrite (remove it deliberately to re-init)"
+    if [ "$DRY" = 1 ]; then
+      say "dry-run: would create $DIR (0711), prompt for a password, write $DIR/users (hash + TOTP seed, 0440, group $GATE_UID),"
+      say "dry-run: $DIR/totp-key (0600), and show the authenticator URI once"
+      exit 0
+    fi
+    command -v htpasswd >/dev/null || die "htpasswd missing (apt install apache2-utils); needed for the bcrypt hash"
+    command -v openssl  >/dev/null || die "openssl missing"
+    [ -t 0 ] && [ -t 1 ] || die "init must run on an interactive terminal (the TOTP seed is shown once, never logged)"
+    umask 077
+    install -d -m 0711 -o root -g root "$DIR"
+    read -rsp "New password for '$USERNAME' (min 12 chars): " p1; echo
+    read -rsp "Repeat: " p2; echo
+    [ "$p1" = "$p2" ] || die "passwords differ"
+    [ "${#p1}" -ge 12 ] || die "password too short"
+    # bcrypt cost 12; the password goes in on stdin, never on a command line. Only the hash is stored.
+    hash=$(printf '%s' "$p1" | htpasswd -niBC 12 "$USERNAME" | cut -d: -f2-)
+    unset p1 p2
+    case "$hash" in '$2'*) ;; *) die "hash generation failed" ;; esac
+    seed=$(openssl rand 20 | base32 | tr -d '=\n')
+    [ "${#seed}" -ge 32 ] || die "TOTP seed generation failed"
+    printf '%s\n' "$seed" > "$DIR/totp-key"; chmod 0600 "$DIR/totp-key"
+    printf '%s:%s:%s\n' "$USERNAME" "$hash" "$seed" > "$DIR/users.new"
+    chown "root:$GATE_UID" "$DIR/users.new"; chmod 0440 "$DIR/users.new"
+    mv "$DIR/users.new" "$DIR/users"
+    uri="otpauth://totp/${ISSUER}:${USERNAME}?secret=${seed}&issuer=${ISSUER}&algorithm=SHA1&digits=6&period=30"
+    echo
+    echo "Add this to your authenticator app now. It is not shown again:"
+    if command -v qrencode >/dev/null; then qrencode -t ANSIUTF8 "$uri"; else echo "(qrencode not installed; enter the URI by hand)"; fi
+    echo "$uri"
+    unset seed uri hash
+    echo
+    say "created $DIR/users and $DIR/totp-key. Next: start the sign-in service, then 'hs-trinity-gate on'."
+    ;;
+  on)
+    [ "$DRY" = 1 ] || [ -s "$DIR/users" ] || die "no users file; run 'hs-trinity-gate init' first"
+    apply_snippet "# hs-trinity-gate: ON. Every Trinity page except the token-bearing paths asks the sign-in service first.
+forward_auth $GATE_ADDR {
+	uri /api/auth/caddy
+}"
+    say "gate ON"
+    ;;
+  off)
+    apply_snippet "# hs-trinity-gate: OFF (break-glass). Trinity's own login only. Turn back on: hs-trinity-gate on"
+    say "gate OFF: the web UI no longer asks for the second factor. Turn back on: hs-trinity-gate on"
+    ;;
+  status)
+    [ -s "$DIR/users" ] && echo "users file: present" || echo "users file: missing (run init)"
+    if [ -f "$SNIPPET" ] && grep -q '^forward_auth' "$SNIPPET"; then echo "caddy gate: ON"; else echo "caddy gate: OFF or not installed"; fi
+    grep -qs "import $SNIPPET" "$CADDYFILE" && echo "caddyfile import: present" || echo "caddyfile import: NOT found in $CADDYFILE"
+    code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$GATE_ADDR/api/healthz" 2>/dev/null || true)
+    case "$code" in 2??) echo "sign-in service: up" ;; *) echo "sign-in service: down (${code:-no answer})" ;; esac
+    ;;
+  *) usage >&2; exit 2 ;;
+esac

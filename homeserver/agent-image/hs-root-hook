@@ -1,0 +1,112 @@
+#!/usr/bin/python3 -IS
+"""hs-root-hook NAME: run one of upstream startup.sh's two root hooks, once per container start.
+
+Installed root-owned at /usr/local/sbin/hs-root-hook. sudoers allows exactly
+`hs-root-hook runtime-config` and `hs-root-hook routing-env`, with no SETENV, so
+the caller cannot pass variables (LD_PRELOAD and friends are refused by sudo).
+
+The hooks read their input from the environment (AGENT_GUARDRAILS, the routing
+and proxy names). That input must be the container's own, not the caller's, so
+this wrapper ignores its own environment and rebuilds one from /proc/1/environ:
+the environment PID 1 (/app/startup.sh, root-owned in this image) started with,
+which is what the container was created with. Loader and interpreter variables
+are dropped even from that.
+
+Each hook runs at most once per container start (keyed on PID 1's start time),
+so an agent cannot re-run it later to rewrite the root-owned files it produces.
+"""
+import os
+import sys
+
+HOOKS = {
+    "runtime-config": ["/usr/bin/python3", "-E", "-s", "/opt/trinity/hooks/write-runtime-config.py"],
+    "routing-env": ["/usr/local/bin/python3", "-I", "-S", "/opt/trinity/hooks/write-routing-env.py"],
+}
+DROP_PREFIXES = ("LD_", "PYTHON", "BASH_FUNC_")
+DROP_NAMES = {"BASH_ENV", "ENV", "IFS", "PERL5LIB", "PERL5OPT", "RUBYOPT", "NODE_OPTIONS", "GCONV_PATH",
+              "LOCPATH", "MALLOC_CHECK_", "TMPDIR", "HOSTALIASES", "RESOLV_HOST_CONF"}
+SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def parse_environ(raw: bytes) -> dict:
+    """NUL-separated NAME=value records, as in /proc/<pid>/environ."""
+    out = {}
+    for rec in raw.split(b"\0"):
+        if not rec or b"=" not in rec:
+            continue
+        name, _, value = rec.partition(b"=")
+        try:
+            out[name.decode("ascii")] = value.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return out
+
+
+def clean_env(container_env: dict) -> dict:
+    env = {}
+    for name, value in container_env.items():
+        if name in DROP_NAMES or name.startswith(DROP_PREFIXES):
+            continue
+        env[name] = value
+    env["PATH"] = SAFE_PATH
+    return env
+
+
+def pid1_start(proc_root: str) -> str:
+    """Field 22 of /proc/1/stat (start time in clock ticks since boot) plus the boot id."""
+    with open(os.path.join(proc_root, "1", "stat"), "rb") as fh:
+        stat = fh.read().decode("ascii", "replace")
+    fields = stat[stat.rindex(")") + 2:].split()
+    start = fields[19]  # field 22 overall; fields[0] is field 3
+    try:
+        with open(os.path.join(proc_root, "sys", "kernel", "random", "boot_id"), encoding="ascii") as fh:
+            boot = fh.read().strip()
+    except OSError:
+        boot = "-"
+    return "%s/%s" % (boot, start)
+
+
+def claim(state_dir: str, name: str, start: str) -> bool:
+    """True the first time NAME is claimed for this PID 1 start, False after that."""
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    path = os.path.join(state_dir, name)
+    try:
+        with open(path, encoding="ascii") as fh:
+            if fh.read().strip() == start:
+                return False
+    except FileNotFoundError:
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="ascii") as fh:
+        fh.write(start + "\n")
+    os.replace(tmp, path)
+    return True
+
+
+def main(argv, proc_root="/proc", state_dir="/run/hs-root-hook", execve=os.execve, euid=None):
+    if len(argv) != 2 or argv[1] not in HOOKS:
+        print("usage: hs-root-hook {%s}" % "|".join(sorted(HOOKS)), file=sys.stderr)
+        return 2
+    if (os.geteuid() if euid is None else euid) != 0:
+        print("hs-root-hook: must run as root (through sudo)", file=sys.stderr)
+        return 1
+    name = argv[1]
+    try:
+        with open(os.path.join(proc_root, "1", "environ"), "rb") as fh:
+            container_env = parse_environ(fh.read())
+        start = pid1_start(proc_root)
+        if not claim(state_dir, name, start):
+            print("hs-root-hook: %s already ran for this container start; refused" % name, file=sys.stderr)
+            return 1
+    except (OSError, ValueError, IndexError) as exc:
+        print("hs-root-hook: cannot read the container environment (%s); refused" % type(exc).__name__,
+              file=sys.stderr)
+        return 1
+    cmd = HOOKS[name]
+    execve(cmd[0], cmd, clean_env(container_env))
+    return 1  # only reached with a stub execve
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

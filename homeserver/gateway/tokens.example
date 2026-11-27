@@ -1,0 +1,5 @@
+# Format: <sha256 hex of the agent's raw gateway token>  <agent name>
+# Make one:  T=$(openssl rand -hex 32); echo "$T" | tr -d '\n' | sha256sum | cut -d' ' -f1
+# Give $T to the agent. Only the hash goes in this file. Hashes below are fake.
+0000000000000000000000000000000000000000000000000000000000000011  agent-a
+0000000000000000000000000000000000000000000000000000000000000012  agent-b
