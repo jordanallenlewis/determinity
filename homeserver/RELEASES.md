@@ -13,22 +13,27 @@ Numbers are never reused: the next `<n>` is one more than the highest tag `v<tri
 exists in the repository, and tags stay when a GitHub Release is deleted. If someone deletes a release **and** its tag,
 the number is only protected when the release workflow passes the names of the existing releases in
 `DETERMINITY_KNOWN_TAGS` (`homeserver/release/determinity-version` reads it); otherwise it could be handed out again,
-and a box that already ran the old one would see two different releases under one name. Do not delete tags.
+and a box that already ran the old one would see two different releases under one name. Do not delete tags. The
+repository's tag rules enforce this: no tag can be moved or deleted, and only the release workflow's deploy key can create a
+`v*-determinity.*` tag (the release job pushes it over SSH; never push one by hand). So a wrong release tag stays where it
+is: release again from a new commit on `hq`, and that number is skipped.
 The release job checks again with its write token, drafts included (deleting a published Release's tag turns it into a
 draft): a Release under the new tag whose `release.json` names another revision, or that has no `release.json`, stops
 the release.
 
 A release that failed after its tag was created is finished with **Re-run failed jobs** on the same run (within 30
 days); a fresh run stops with "HEAD is already released". A person with write access on the repository clicks the
-re-run; automation does not re-run release runs. A re-run resumes only its own tag and Release, and its image jobs stop
-when the tag is already on another revision (a later run took the number). If a newer release is already `latest`, an
+re-run; automation does not re-run release runs. A re-run resumes only its own tag and Release. Use **Re-run failed
+jobs**, not "Re-run all jobs": the image jobs stop whenever the tag already exists (they ran before it was created, and a
+re-run of them would push images over a released version's tags). Two runs that both failed before the tag share a number:
+re-running the older one releases the older revision under it, so re-run the newer one. If a newer release is already `latest`, an
 older one that finishes late is published without moving `latest` on the Release or the images; if `latest` cannot be
 read, the run stops before publishing and a re-run finishes it.
 
 After 30 days GitHub no longer offers the re-run. Leave the tag and the draft Release as they are (the number stays
 used; servers never read a draft) and release again from a new commit on `hq`: the next run takes the next number.
 A draft without `release.json` that an earlier attempt of the same release left behind (cancelled while creating or
-uploading) stops every re-run; a person deletes that draft Release, not the tag, and re-runs the failed jobs.
+uploading; its tag is on that run's revision) stops every re-run; a person deletes that draft Release, not the tag, and re-runs the failed jobs.
 A new Trinity release that the daily sync merges into `hq` starts a new release on its own. A Determinity-only change
 is released by running the **Determinity release** workflow on `hq` from the Actions tab.
 
@@ -130,9 +135,18 @@ systemd-run --wait --pipe --quiet -p EnvironmentFile=/etc/default/hs-release /us
 systemd-run --wait --pipe --quiet -p EnvironmentFile=/etc/default/hs-release /usr/local/sbin/hs-release status
                                     # must print no HS_RELEASE_ALERT_URL warning (unset or not a valid URL)
 hs-release apply <latest tag>       # the first switch, by hand, watched; <latest tag> is the Release marked
-                                    # "Latest" on the Releases page (an older tag puts a hold on latest)
+                                    # "Latest" on the Releases page (an older tag puts a hold on latest).
+                                    # Run by hand, hs-release and hs-release-alert read /etc/default/hs-release
+                                    # themselves, so they see the same settings as the units
 systemctl daemon-reload && systemctl enable --now hs-release.timer
 ```
+
+`hs-release` and `hs-release-alert` read `/etc/default/hs-release` themselves when you run them by hand, the way
+systemd's `EnvironmentFile` does for the units: `KEY=VALUE` lines, blank lines and lines starting with `#` skipped,
+optional surrounding quotes removed. The file is never run as shell (a `$(...)` in a value is just text), and a variable
+already set in your environment wins over the file. So `hs-release apply <tag>` and `hs-release rollback --db-restored`
+on an external database see `HS_RELEASE_EXTERNAL_DB` without you exporting it, and a by-hand run probes the ports the
+file sets. (`HS_RELEASE_DEFAULTS` points both at another file; it exists for the tests.)
 
 Setting `HS_RELEASE_ALERT_URL` and receiving the test message are **part of the install**, not an option: with it unset
 every failure (a rollback, a moved schema, a broken state) is only a journal line and nobody is told. `hs-release status`
@@ -187,8 +201,9 @@ was off is not made up at boot). The timer path is deliberately more careful tha
 release**, `hs-release` holds the latest release (it prints how), so the timer does not move forward again the next
 night and undo the choice. A hold is lifted only by `hs-release apply <held tag>` (a person naming it), a rollback that
 lands on it, or deleting its line from `/var/lib/hs-release/refused`. A release newer than the held one is not held and
-the timer follows it once it is old enough. If the latest release cannot be read during that apply, no hold is set and
-`hs-release` prints a WARNING; hold it by hand: `hs-release hold <latest tag>`. By hand: `hs-release check` (exit 10 means a
+the timer follows it once it is old enough. If the latest release cannot be read during that apply, no hold is set; when
+the tag is older than what ran before (or there was nothing to compare with), `hs-release` prints a WARNING after the
+switch result; hold it by hand: `hs-release hold <latest tag>`. By hand: `hs-release check` (exit 10 means a
 newer release exists), then `hs-release apply` or `hs-release apply <tag>`.
 
 `apply` refuses drafts, pre-releases, tags outside the scheme, releases not published by `github-actions[bot]`, a
@@ -227,14 +242,30 @@ alerts every day, not once), and `hs-release status` prints them first:
 | marker | exit | meaning | stops | cleared by |
 |---|---|---|---|---|
 | `/var/lib/hs-release/blocked` | 3 | the schema moved under a release that failed the gate; `release.env` keeps pinning the failed release and, on PostgreSQL, **backend and scheduler are left stopped** (the file says `services_stopped=backend scheduler`; the app is down until a person acts) | the timer path | `hs-release rollback --restore-db`; `hs-release apply <the pinned tag>` (checks the database first, then starts the services and re-runs the gate; healthy clears it; failing leaves it, exit 3, and on the bundled PostgreSQL stops backend and scheduler again; on an external database nothing is stopped and the file says `services_stopped=none`; if that stop fails the state is `broken` too, `services_stopped=FAILED`, exit 4: stop them by hand, then `rollback --restore-db`); or a person fixing forward with `apply <tag>` once that release is healthy. `clear-broken` does not lift it (it exits 3 while `blocked` stays) |
-| `/var/lib/hs-release/broken` | 4 | the state is unknown: a release **and** its rollback both failed the gate (`double-failure`), a manual rollback or a restore failed (`rollback-failed`, `restore-failed`), or a run was killed or the host reset between switching and verifying (`interrupted`, found from the `inflight` note), or the re-gate of a blocked release failed and backend and scheduler could not be stopped (`regate-stop-failed`) | every `apply`, the timer's and `apply <tag>` | `hs-release clear-broken`, only |
+| `/var/lib/hs-release/broken` | 4 | the state is unknown: a release **and** its rollback both failed the gate (`double-failure`), a manual rollback or a restore failed (`rollback-failed`, `restore-failed`), or a run was killed or the host reset between switching and verifying (`interrupted`, found from the `inflight` note), or a failed release's backend and scheduler could not be stopped (`apply-stop-failed` on a first failure, `regate-stop-failed` on the re-gate of a blocked release) | every `apply`, the timer's and `apply <tag>` | `hs-release clear-broken`, only |
 
 `broken` holds a reason and a timestamp. While it exists `apply` does nothing and exits 4; `rollback` and
 `rollback --restore-db` still run, because they are the repair tools, but they do not clear it. Fix the platform, then
 run `hs-release clear-broken`: it runs the health gate on what `release.env` pins and clears the marker only if that
 passes (`--force` clears it without the gate). "Running" in `status`, and `current.env`, always equal what `release.env`
 pins; while `broken` is set `status` says "pinned in release.env: X (not verified healthy)", and while `blocked` is set
-"pinned in release.env: X (failed the health gate, NOT a running release; services stopped: ...)", never "running".
+"pinned in release.env: X (failed the health gate, NOT a running release; services stopped: ...)" (with `none` it says
+nothing was stopped, so the release is running and not verified healthy; with `unknown` or `FAILED` that it may be
+serving: check `docker ps`), never "running".
+
+Ways out of `broken` (every one ends with the marker gone and `apply` working again):
+
+1. Fix the platform, then `hs-release clear-broken`: it clears the marker if the health gate passes on what `release.env` pins.
+2. The gate cannot pass but you accept the state (for example the pinned release is the broken one and a healthy tag
+   exists): `hs-release clear-broken --force`, then `hs-release apply <healthy tag>`, which switches to a release that is
+   checked.
+3. Repair with the tools that run while `broken` is set, `hs-release rollback` (or `rollback --restore-db`, or
+   `rollback --db-restored` on an external database), and when the stack is as it should be, `hs-release clear-broken`
+   as in route 1: a rollback does not clear the marker by itself.
+
+A failed stop of backend and scheduler is `broken` (exit 4) in every place it can happen: a first failure on a moved schema
+(`apply-stop-failed`), a rollback that fails the gate while `blocked` (`rollback-failed`), a re-gate of a blocked release
+(`regate-stop-failed`), and a re-gate stopped by Ctrl-C or TERM, which settles the file the same way (`broken` only when its stop fails) and exits 130 or 143.
 
 - **Automatic, schema unchanged:** a release that fails the gate is rolled back at once (exit 2, logged in
   `/var/lib/hs-release/log`; the agent image is re-tagged too). The timer does not try that release again;
@@ -310,7 +341,10 @@ unset, or the POST fails, it writes them to the journal at priority `err`
 `hs-release-alert --test` sends a test message and exits non-zero when the URL is unset or the POST fails. While it is
 unset, or set to something that is not a single `http(s)://` URL (a trailing comment in the file becomes part of the
 value), `hs-release status` and every non-zero `hs-release` exit print a warning line, and `--test` fails. When a `blocked` marker exists the
-alert says that the backend and scheduler are stopped on purpose. `homeserver/ops/` has no shared alert channel to reuse
+alert says what its `services_stopped=` records: `backend scheduler`, that they are stopped on purpose and the app is down
+until a person acts; `none` (an external database), that nothing was stopped and the failed release is running and has
+not been verified healthy; `unknown` or `FAILED`, that the stop did not finish or failed, the failed release may be
+serving on a moved schema, and `docker ps` shows what runs. `homeserver/ops/` has no shared alert channel to reuse
 (`hs-caretaker` raises Trinity notifications, which needs its token and a working backend; this alert must work when the
 backend is the thing that failed).
 

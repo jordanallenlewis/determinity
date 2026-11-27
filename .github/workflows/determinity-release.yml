@@ -5,7 +5,7 @@ name: Determinity release
 # and release.json (the machine-readable contract, see homeserver/RELEASES.md).
 #
 # Gate: pushes to `hq` start none of the inherited CI workflows (they run on
-# main/dev, and a push by the sync's GITHUB_TOKEN starts nothing at all), so
+# main/dev; a push to hq starts only hq-images.yml and hq-homeserver-tests.yml), so
 # the `ci` job dispatches the test workflows on `hq` itself and waits for them
 # to pass on exactly the revision being released, and the `unit` job runs the
 # backend unit suite against its committed failure baseline. A red or missing
@@ -14,10 +14,14 @@ name: Determinity release
 # Run it from the Actions tab on `hq` (or `gh workflow run determinity-release.yml
 # --ref hq`). The upstream sync starts it after it merges a new upstream release.
 #
-# The tag is created by this workflow's GITHUB_TOKEN, and GitHub starts no other
-# workflow for a ref that token creates. So inherited tag-triggered workflows
-# (publish-images.yml on `v*`) do not run for a Determinity tag. Never push a
-# Determinity tag by hand: that would start them.
+# The tag is pushed over SSH with the fork's deploy key (environment hq-push,
+# secret HQ_PUSH_KEY): the tag ruleset lets no other actor create a
+# v*-determinity.* tag, and tags can be neither moved nor deleted. A push by
+# that key starts every workflow whose trigger matches the tag. The inherited
+# tag workflow publish-images.yml (`v*`) would match and is kept off by the
+# switch in the Actions settings, so the release job reads that switch, and
+# every push and create trigger in the tree, before it pushes, and stops if
+# anything could start. Never push a Determinity tag by hand.
 #
 # Order is what keeps a half-finished release invisible: images first (by
 # version tag), then the tag + draft Release + release.json, then publish, then
@@ -27,9 +31,9 @@ name: Determinity release
 # days): a fresh run stops in `plan` with "HEAD is already released". The
 # release job resumes only its own work: a tag on this revision, and a Release
 # for that tag whose release.json names this revision. Anything else under
-# that tag stops it. The image jobs stop too when the tag is already on another
-# revision, so a late re-run of an older run cannot push its images over a
-# released version's image tags. A person with write access clicks the re-run;
+# that tag stops it. The image jobs stop whenever the tag already exists, so a
+# late re-run of an older run cannot push its images over a released version's
+# image tags, and a "Re-run all jobs" cannot rebuild a released version. A person with write access clicks the re-run;
 # after 30 days GitHub no longer offers it: leave the tag and the draft as they
 # are and release from a new commit on `hq`, which takes the next number.
 
@@ -248,11 +252,14 @@ jobs:
           submodules: false
           persist-credentials: false
 
-      # A re-run of an older run ("Re-run failed jobs") would otherwise push
-      # this revision's images over the version tags of a release that a later
-      # run already cut under the same number. The tag is created only by the
-      # release job, so a tag on another revision means the number is taken.
-      - name: Version not taken by another revision
+      # The tag is created only by the release job, after every image job of
+      # the run has passed, and "Re-run failed jobs" never re-runs a job that
+      # passed. So an image job that finds the tag at all is a re-run of an
+      # older run (it would push its images over a later release's version
+      # tags) or a "Re-run all jobs" of a finished release (it would move the
+      # version tags to a new build). Either way: stop. Tags cannot be deleted
+      # (tag ruleset), so a number once tagged stays taken.
+      - name: Version not tagged yet
         if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -262,8 +269,12 @@ jobs:
         run: |
           set -euo pipefail
           if sha=$(gh api "repos/${REPO}/git/ref/tags/${P_TAG}" --jq .object.sha 2>tag.err); then
-            [ "$sha" = "$P_REVISION" ] \
-              || { echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"; exit 1; }
+            if [ "$sha" = "$P_REVISION" ]; then
+              echo "::error::tag ${P_TAG} already exists on this revision: its images were pushed by the run that created it. Not pushing them again. If that run's release job failed, use \"Re-run failed jobs\" on it, which leaves the image jobs alone"
+            else
+              echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"
+            fi
+            exit 1
           elif grep -q '(HTTP 404)' tag.err; then
             echo "tag ${P_TAG} not created yet"
           else
@@ -407,11 +418,14 @@ jobs:
           submodules: false
           persist-credentials: false
 
-      # A re-run of an older run ("Re-run failed jobs") would otherwise push
-      # this revision's images over the version tags of a release that a later
-      # run already cut under the same number. The tag is created only by the
-      # release job, so a tag on another revision means the number is taken.
-      - name: Version not taken by another revision
+      # The tag is created only by the release job, after every image job of
+      # the run has passed, and "Re-run failed jobs" never re-runs a job that
+      # passed. So an image job that finds the tag at all is a re-run of an
+      # older run (it would push its images over a later release's version
+      # tags) or a "Re-run all jobs" of a finished release (it would move the
+      # version tags to a new build). Either way: stop. Tags cannot be deleted
+      # (tag ruleset), so a number once tagged stays taken.
+      - name: Version not tagged yet
         if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -421,8 +435,12 @@ jobs:
         run: |
           set -euo pipefail
           if sha=$(gh api "repos/${REPO}/git/ref/tags/${P_TAG}" --jq .object.sha 2>tag.err); then
-            [ "$sha" = "$P_REVISION" ] \
-              || { echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"; exit 1; }
+            if [ "$sha" = "$P_REVISION" ]; then
+              echo "::error::tag ${P_TAG} already exists on this revision: its images were pushed by the run that created it. Not pushing them again. If that run's release job failed, use \"Re-run failed jobs\" on it, which leaves the image jobs alone"
+            else
+              echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"
+            fi
+            exit 1
           elif grep -q '(HTTP 404)' tag.err; then
             echo "tag ${P_TAG} not created yet"
           else
@@ -485,9 +503,14 @@ jobs:
     name: release (tag, Release, release.json, latest)
     needs: [plan, images, agent-image]
     runs-on: ubuntu-latest
+    # The tag ruleset lets only the deploy key create v*-determinity.* tags.
+    # The key lives in this environment (deployments from `hq` only) and is
+    # read by one step, "Push the tag (deploy key)".
+    environment: hq-push
     permissions:
-      contents: write   # tag and Release
+      contents: write   # Release and release.json (the tag goes over SSH)
       packages: write   # move `latest` on the images
+      actions: read     # check that no workflow starts on the tag
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
@@ -617,17 +640,16 @@ jobs:
           } > notes.md
           cat notes.md
 
-      - name: Create the tag and the Release
-        id: publish
+      # Order: Releases under this name (checked) -> no workflow starts on the
+      # tag (checked) -> tag (deploy key, checked) -> draft Release ->
+      # release.json (checked) -> publish. Nothing a server reads exists
+      # before every check has passed. Re-runnable: a tag on this revision and
+      # a Release from an earlier attempt of this release are reused; a
+      # published Release is never rewritten.
+      - name: Releases under this name
         if: env.DRY != 'true'
         run: |
           set -euo pipefail
-          # Order: tag (checked) -> draft Release -> release.json (checked) ->
-          # publish. Nothing a server reads exists before every check has
-          # passed. Re-runnable: a tag on this revision and a Release from an
-          # earlier attempt of this release are reused; a published Release is
-          # never rewritten.
-
           # Existing Releases under this tag, drafts included (the plan job's
           # read-only token cannot see drafts). Deleting a published Release's
           # tag turns it into a draft, so a draft can be an old release whose
@@ -639,7 +661,7 @@ jobs:
             [ -n "$rid" ] || continue
             aid=$(gh api "repos/${REPO}/releases/${rid}" --jq '[.assets[] | select(.name == "release.json") | .id][0] // empty')
             if [ -z "$aid" ]; then
-              echo "::error::Release ${rid} for ${TAG} is a Release without release.json; not touching it. If it is a draft left by an earlier attempt of THIS release (cancelled during create or upload: the tag ${TAG} is absent or on ${REVISION}), a person deletes that draft Release (not the tag) and re-runs the failed jobs. Otherwise the number may have been used: see RELEASES.md, \"Versions\""
+              echo "::error::Release ${rid} for ${TAG} is a Release without release.json; not touching it. If it is a draft left by an earlier attempt of THIS release (cancelled during create or upload: the tag ${TAG} is on ${REVISION}), a person deletes that draft Release (not the tag) and re-runs the failed jobs. Otherwise the number may have been used: see RELEASES.md, \"Versions\""
               exit 1
             fi
             rev=$(gh api -H 'Accept: application/octet-stream' "repos/${REPO}/releases/assets/${aid}" | jq -r '.revision // empty')
@@ -647,13 +669,96 @@ jobs:
           done < same-name.txt
           [ "$(wc -l < same-name.txt)" -le 1 ] || { echo "::error::more than one Release for ${TAG}"; exit 1; }
 
-          if sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null); then
+      # A tag pushed with the deploy key starts every workflow whose push
+      # trigger matches it, and every workflow on `create` (unlike a ref made
+      # by this job's token). Inherited tag workflows stay off by a switch in
+      # the Actions settings, not by anything in the tree, so read the switch
+      # and the tree before pushing: every workflow at this revision that a
+      # tag push can start (a push trigger that can match a tag, or any create
+      # trigger) must be disabled, or be one of the two whose tag pattern
+      # cannot match a Determinity tag. Anything else (a new tag workflow from
+      # upstream, a switch turned back on, a state that cannot be read) stops
+      # here.
+      - name: No workflow starts on the tag
+        if: env.DRY != 'true'
+        run: |
+          set -euo pipefail
+          bad=0
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            [ -e "$f" ] || continue
+            on=$(yq -o=json '.on' "$f")
+            # tag-capable: any create trigger (it has no filters), push with
+            # no ref filter at all, or push with tags/tags-ignore
+            kind=$(jq -r '
+              if (type == "string" and . == "create")
+                 or (type == "array" and index("create") != null)
+                 or (type == "object" and has("create")) then "create"
+              elif type == "string" then (if . == "push" then "any" else "none" end)
+              elif type == "array" then (if index("push") != null then "any" else "none" end)
+              elif type == "object" and has("push") then
+                (.push // {}) as $p
+                | if ($p | type) != "object" then "any"
+                  elif ($p | has("tags") or has("tags-ignore")) then "tags"
+                  elif ($p | has("branches") or has("branches-ignore")) then "none"
+                  else "any" end
+              else "none" end' <<<"$on")
+            [ "$kind" != none ] || continue
+            name=$(basename "$f")
+            pats=$(jq -c '.push.tags // null' <<<"$on" 2>/dev/null || echo null)
+            case "$kind:$name:$pats" in
+              'tags:publish-cli.yml:["cli-v*"]'|'tags:publish-helper-mcp.yml:["helper-mcp-v*"]')
+                echo "$name: tag pattern $pats cannot match ${TAG}"; continue ;;
+            esac
+            state=$(gh api "repos/${REPO}/actions/workflows/${name}" --jq .state 2>wf.err) \
+              || { echo "::error::$name can start on a tag push and its state cannot be read ($(head -c 200 wf.err))"; bad=1; continue; }
+            if [ "$state" = disabled_manually ]; then
+              echo "$name: can start on a tag push, disabled ($state)"
+            else
+              echo "::error::$name starts on a tag push ($kind, tags $pats) and is $state: pushing ${TAG} would run it. Disable it in the Actions settings, or check what it does with a Determinity tag first"
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] || exit 1
+
+      # Pushed over SSH with the deploy key, the only actor the tag ruleset
+      # lets create v*-determinity.* tags. The key is written to a private
+      # temp dir, used for this one push (GitHub's published host key pinned,
+      # explicit refspec, never --force or --tags) and deleted when the step
+      # ends. Never push a Determinity tag by hand.
+      - name: Push the tag (deploy key)
+        if: env.DRY != 'true'
+        env:
+          HQ_PUSH_KEY: ${{ secrets.HQ_PUSH_KEY }}
+        run: |
+          set -euo pipefail
+          if sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>tag.err); then
             echo "tag $TAG exists at $sha"
+          elif grep -q '(HTTP 404)' tag.err; then
+            [ -n "${HQ_PUSH_KEY:-}" ] || { echo "::error::HQ_PUSH_KEY is empty: this job must run in the hq-push environment, from hq"; exit 1; }
+            keydir=$(mktemp -d "${RUNNER_TEMP:-/tmp}/hq-push.XXXXXX")
+            trap 'rm -rf "$keydir"' EXIT
+            ( umask 077; printf '%s\n' "$HQ_PUSH_KEY" > "$keydir/key" )
+            echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$keydir/known_hosts"
+            git tag "$TAG" "$REVISION"   # lightweight, as the refs API made it
+            GIT_SSH_COMMAND="ssh -i $keydir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$keydir/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes" \
+              git push "git@github.com:${REPO}.git" "refs/tags/${TAG}:refs/tags/${TAG}"
+            sha=
+            for _ in 1 2 3 4 5 6; do
+              sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null || true)
+              [ -n "$sha" ] && break
+              sleep 5
+            done
           else
-            # Lightweight tag by this token: GitHub starts no workflow for it.
-            gh api -X POST "repos/${REPO}/git/refs" -f "ref=refs/tags/${TAG}" -f "sha=${REVISION}" >/dev/null
-            sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)
+            echo "::error::could not read tag ${TAG} ($(head -c 300 tag.err))"; exit 1
           fi
+          [ "$sha" = "$REVISION" ] || { echo "::error::tag $TAG points at '${sha}', expected $REVISION"; exit 1; }
+
+      - name: Create the Release
+        id: publish
+        if: env.DRY != 'true'
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)
           [ "$sha" = "$REVISION" ] || { echo "::error::tag $TAG points at $sha, expected $REVISION"; exit 1; }
 
           if state=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then

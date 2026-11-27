@@ -17,11 +17,57 @@
 #                             A required install step (RELEASES.md, "Install").
 set -euo pipefail
 
+# The defaults file, read the way systemd's EnvironmentFile reads it, so a run by
+# hand sees the same settings as the units (the same code is in hs-release).
+# KEY=VALUE lines; blank lines and lines starting with # or ; are skipped;
+# surrounding quotes are stripped. The file is data: it is never sourced or
+# evaluated, a `$(...)` in it is just text. A variable already set in the
+# environment wins. HS_RELEASE_DEFAULTS moves the path (tests).
+load_defaults() {
+  local f=${HS_RELEASE_DEFAULTS:-/etc/default/hs-release} line k v
+  [ -f "$f" ] && [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case $line in ''|'#'*|';'*) continue ;; esac
+    [[ $line == *=* ]] || continue
+    k=${line%%=*}; v=${line#*=}
+    [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case $k in IFS|PS4|ENV|BASH*|SHELL*|LD_*) continue ;; esac   # nothing that changes how this shell runs
+    [ -z "${!k+x}" ] || continue
+    if [ "${#v}" -ge 2 ]; then
+      case $v in
+        \"*\") v=${v:1:${#v}-2} ;;
+        \'*\') v=${v:1:${#v}-2} ;;
+      esac
+    fi
+    export "$k=$v"
+  done < "$f"
+}
+load_defaults
+
 STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
 host=$(hostname)
+# What the BLOCKED line says depends on what the blocked file records in
+# services_stopped=: only `backend scheduler` means the app was stopped on purpose.
+blocked_line() {
+  [ -f "$STATE/blocked" ] || return 0
+  local tag stopped
+  tag=$(sed -n 's/^tag=//p' "$STATE/blocked"); stopped=$(sed -n 's/^services_stopped=//p' "$STATE/blocked")
+  case $stopped in
+    "backend scheduler")
+      echo "BLOCKED: the failed release $tag is pinned and its backend and scheduler are stopped on purpose (services_stopped=$stopped): the app is down until a person acts." ;;
+    none)
+      echo "BLOCKED: the failed release $tag is pinned and nothing was stopped (services_stopped=none, an external database): the failed release is running and has NOT been verified healthy. A person has to act." ;;
+    *)
+      echo "BLOCKED: the failed release $tag is pinned and the stop of its backend and scheduler did not finish or failed (services_stopped=$stopped): the failed release may be serving on a moved schema. Check docker ps, then a person has to act." ;;
+  esac
+}
+
 msg="hs-release on $host did not finish cleanly (rolled back, schema moved, broken, or an error). Last log lines:
 $(tail -n 8 "$STATE/log" 2>/dev/null || echo '(no log)')
-$(if [ -f "$STATE/blocked" ]; then echo "BLOCKED: the failed release $(sed -n 's/^tag=//p' "$STATE/blocked") is pinned and its backend and scheduler are stopped on purpose (services_stopped=$(sed -n 's/^services_stopped=//p' "$STATE/blocked")): the app is down until a person acts."; fi)
+$(blocked_line)
 Next steps: hs-release status; see RELEASES.md, \"Rolling back\"."
 
 url_problem() {  # why the URL is unusable; nothing when unset or fine
