@@ -14,6 +14,14 @@ exists in the repository, and tags stay when a GitHub Release is deleted. If som
 the number is only protected when the release workflow passes the names of the existing releases in
 `DETERMINITY_KNOWN_TAGS` (`homeserver/release/determinity-version` reads it); otherwise it could be handed out again,
 and a box that already ran the old one would see two different releases under one name. Do not delete tags.
+The release job checks again with its write token, drafts included (deleting a published Release's tag turns it into a
+draft): a Release under the new tag whose `release.json` names another revision, or that has no `release.json`, stops
+the release.
+
+A release that failed after its tag was created is finished with **Re-run failed jobs** on the same run (within 30
+days); a fresh run stops with "HEAD is already released". A re-run resumes only its own tag and Release. If a newer
+release is already `latest`, an older one that finishes late is published without moving `latest` on the Release or
+the images.
 A new Trinity release that the daily sync merges into `hq` starts a new release on its own. A Determinity-only change
 is released by running the **Determinity release** workflow on `hq` from the Actions tab.
 
@@ -88,7 +96,7 @@ by a variable: `DETERMINITY_BACKEND_IMAGE`, `DETERMINITY_FRONTEND_IMAGE`, `DETER
 the `compose/trinity` wrapper reads both.
 
 A machine follower must also check that the release was published by `github-actions[bot]` (`author.login` in the
-releases API) and that every `ref` is exactly `ghcr.io/<owner of this repo>/determinity-<service>@sha256:<64 hex>`;
+releases API), that the `release.json` asset was uploaded by the same login (`assets[].uploader.login`), and that every `ref` is exactly `ghcr.io/<owner of this repo>/determinity-<service>@sha256:<64 hex>`;
 `hs-release` refuses anything else before it writes a file or pulls an image.
 
 Install (as root, from the `homeserver/` folder of a checkout of the release tag, `git checkout v1.0.5-determinity.1`;
@@ -102,15 +110,20 @@ install -m 0755 compose/trinity /usr/local/sbin/hs-trinity           # the compo
 cat > /etc/default/hs-release <<'CONF'
 TRINITY_DIR=/srv/trinity
 # BOX_BACKEND_PORT=8000  BOX_MCP_PORT=18080  FRONTEND_PORT=80   (only if not the defaults)
-# HS_RELEASE_ALERT_URL=https://ntfy.example.com/hs-release       (see "Alerts")
+HS_RELEASE_ALERT_URL=https://ntfy.example.com/hs-release          # REQUIRED, see "Alerts"; replace with your own topic
 # HS_RELEASE_MIN_AGE_HOURS=24   HS_RELEASE_AGENT_IMAGE=yes   (the defaults; see "Upgrading")
 # HS_RELEASE_EXTERNAL_DB=own-backups-no-rollback-across-migration   (only for an external PostgreSQL; see "Rolling back")
 # HS_RELEASE_FILES="homeserver/release/hs-release=/usr/local/sbin/hs-release ..."   (only if you install elsewhere)
 CONF
-hs-release status
+hs-release-alert --test                                           # required: must print "test message sent" and reach you
+hs-release status                                                 # must not print "HS_RELEASE_ALERT_URL is not set"
 hs-release apply v1.0.5-determinity.1                             # the first switch, by hand, watched
 systemctl daemon-reload && systemctl enable --now hs-release.timer
 ```
+
+Setting `HS_RELEASE_ALERT_URL` and receiving the test message are **part of the install**, not an option: with it unset
+every failure (a rollback, a moved schema, a broken state) is only a journal line and nobody is told. `hs-release status`
+and every non-zero exit of `hs-release` print a warning while it is unset.
 
 Always run compose through `hs-trinity` (or with `--env-file .env --env-file release.env`): without `release.env` the
 four images fall back to the moving `:latest` tag instead of the pinned digests.
@@ -156,7 +169,10 @@ was off is not made up at boot). The timer path is deliberately more careful tha
   `latest` therefore does not downgrade the box; a tag it cannot compare is not moved to either. Both are logged.
 - **Held releases** (failed here, or rolled back from) are skipped.
 
-`hs-release apply <tag>` by a person ignores all three. By hand: `hs-release check` (exit 10 means a
+`hs-release apply <tag>` by a person ignores all three, with one consequence: when the tag is **older than the latest
+release**, `hs-release` holds the latest release (it prints how), so the timer does not move forward again the next
+night and undo the choice. Release the hold with `hs-release apply <latest tag>`, or by deleting the line from
+`/var/lib/hs-release/refused`. A release newer than that one is still followed by the timer. By hand: `hs-release check` (exit 10 means a
 newer release exists), then `hs-release apply` or `hs-release apply <tag>`.
 
 `apply` refuses drafts, pre-releases, tags outside the scheme, releases not published by `github-actions[bot]`, a
@@ -194,7 +210,7 @@ alerts every day, not once), and `hs-release status` prints them first:
 
 | marker | exit | meaning | stops | cleared by |
 |---|---|---|---|---|
-| `/var/lib/hs-release/blocked` | 3 | the schema moved under a release that failed the gate; the images were left as they are | the timer path | `hs-release rollback --restore-db`; or a person fixing forward with `apply <tag>` once that release is healthy |
+| `/var/lib/hs-release/blocked` | 3 | the schema moved under a release that failed the gate; `release.env` keeps pinning the failed release and, on PostgreSQL, **backend and scheduler are left stopped** (the file says `services_stopped=backend scheduler`; the app is down until a person acts) | the timer path | `hs-release rollback --restore-db`; `hs-release apply <the pinned tag>` (starts the services and re-runs the gate; healthy clears it, failing leaves it, exit 3); or a person fixing forward with `apply <tag>` once that release is healthy |
 | `/var/lib/hs-release/broken` | 4 | the state is unknown: a release **and** its rollback both failed the gate (`double-failure`), a manual rollback or a restore failed (`rollback-failed`, `restore-failed`), or a run was killed or the host reset between switching and verifying (`interrupted`, found from the `inflight` note) | every `apply`, the timer's and `apply <tag>` | `hs-release clear-broken`, only |
 
 `broken` holds a reason and a timestamp. While it exists `apply` does nothing and exits 4; `rollback` and
@@ -210,8 +226,10 @@ pins; while `broken` is set `status` says "pinned in release.env: X (not verifie
   is `broken` (exit 4, not 2).
 - **Automatic, schema moved (exit 3):** if the Alembic revision after the failed gate differs from the one recorded
   before (or cannot be read), the new backend probably migrated the database and the old images could crash or damage
-  it. The images are **not** rolled back. The failed release stays recorded as current, the tag is held, and
-  `/var/lib/hs-release/blocked` is written; the timer then refuses to apply anything (exit 3 each day, which alerts)
+  it. The images are **not** rolled back. The failed release stays pinned in `release.env` but is **not serving**:
+  backend and scheduler were stopped for the revision read and stay stopped (a failed release must not run on a moved
+  schema; frontend and mcp-server keep running). The tag is held, and
+  `/var/lib/hs-release/blocked` is written (with `services_stopped=`; `status`, the log and the alert say so too); the timer then refuses to apply anything (exit 3 each day, which alerts)
   until a person restores (a restore that itself fails is `broken`):
 
   ```
@@ -230,22 +248,36 @@ pins; while `broken` is set `status` says "pinned in release.env: X (not verifie
   `previous.meta`, the pre-failure dump, which pruning also never deletes): that attempt takes its own dump
   (`<tag>-retry-*`) and, if it fails the gate with the schema unchanged, goes back to the release that was running.
   `rollback --restore-db` keeps restoring the pre-failure dump.
-- **By hand, schema unchanged:** `hs-release rollback` switches to the previous state and, run twice, back again. It
+- **`clear-broken` while blocked** does not lift `blocked`; it says so, names the commands above and exits 3.
+- **By hand, schema unchanged:** `hs-release rollback` (when its gate passes it also clears `blocked`) switches to the previous state and, run twice, back again. It
   refuses (exit 3) when the current Alembic revision differs from the one recorded for the rollback target, and
   points at `--restore-db`.
 - **A manual rollback sticks:** the release you rolled back from is held, so the timer does not put it back the
   next night. `hs-release apply <tag>` clears the hold. `hs-release status` lists held tags and any blocked or broken state. If the manual
   rollback itself fails the gate, the state is `broken`.
-- **SQLite installs** (`DATABASE_URL` empty or `sqlite:`, even though `docker-compose.hosted.yml` always defines a `postgres` service): no backup is taken and the schema is not tracked, so a rollback is
+- **The database is decided from the URL, strictly.** Bundled means: scheme `postgresql` (or `postgres`, with an
+  optional `+driver`), host exactly `postgres`, port empty or `5432`, database name equal to the `postgres` service's
+  `POSTGRES_DB`, no query string and a single `@`. Anything else that is not `sqlite:` (another host, another database,
+  `?host=...`, a password containing `@postgres:`) is treated as external. A backend with no `DATABASE_URL` (no backend
+  service, no key, or null) is refused with a message: nothing is guessed. Set but empty (`DATABASE_URL=`) is
+  upstream's SQLite switch (`docker-compose.hosted.yml`, backend `DATABASE_URL` comment) and is read as SQLite.
+- **SQLite installs** (`DATABASE_URL` an explicit `sqlite:` URL or set but empty, even though `docker-compose.hosted.yml` always defines a `postgres` service): no backup is taken and the schema is not tracked, so a rollback is
   code-only as before. An image rollback does not undo a migration there either; Trinity keeps its own copies under
   `~/trinity-data/backups/` (`pre-migration-*.db`, `trinity-backup-*.db`). Stop the stack and restore one before running
   older images.
-- **External PostgreSQL** (a `DATABASE_URL` whose host is not `postgres`): `apply` refuses, because this updater takes no
+- **External PostgreSQL** (a `DATABASE_URL` that is not the bundled one, above): `apply` refuses, because this updater takes no
   backup of a database it does not run. Setting `HS_RELEASE_EXTERNAL_DB=own-backups-no-rollback-across-migration` in
   `/etc/default/hs-release` states that you take your own backups and accept that a release that fails the gate is never
   rolled back automatically: the schema is treated as moved, the state is `blocked` (exit 3) and the images stay. Restore
   your own backup, then run `hs-release rollback --db-restored`, which runs the previous images and clears `blocked`;
-  `--restore-db` is refused there.
+  `--restore-db` is refused there. A plain `hs-release rollback` is refused too, blocked or not: with no schema
+  check possible, `--db-restored` is you stating that the database is back at what the previous release expects.
+- **A switch interrupts running work.** `apply` and `rollback` recreate the backend, which stops any agent execution
+  running at that moment; hs-release does not look for running executions first (Trinity has no endpoint for that, and
+  none is assumed). That is why the timer runs at its fixed off-peak hour (04:15 Pacific); for a by-hand `apply` or
+  `rollback` pick a quiet time. Open item: a check for running executions before a restart.
+- After `rollback --restore-db` the record in `previous.meta` names the backup that was restored (`RESTORED_FROM=`),
+  and the log says so.
 - On PostgreSQL the `pre-migration-*.db` files do not exist; the dumps in `/var/lib/hs-release/backups/` are the
   recovery points for this updater. They are on the same disk as the database: they protect against a bad release, not
   against losing the disk.
@@ -257,7 +289,10 @@ a moved schema (3) and a broken state (4, every day until cleared), so every one
 `TimeoutStartSec=45min` (a normal run takes minutes; if systemd kills a run mid-switch the next run records it as broken). `hs-release-alert` POSTs the last log lines as `text/plain`
 (ntfy-style, with `Title` and `Priority` headers) to `HS_RELEASE_ALERT_URL` from `/etc/default/hs-release`. If that is
 unset, or the POST fails, it writes them to the journal at priority `err`
-(`journalctl -t hs-release-alert -p err`). `homeserver/ops/` has no shared alert channel to reuse
+(`journalctl -t hs-release-alert -p err`). Unset means nobody is told, so the install steps require it:
+`hs-release-alert --test` sends a test message and exits non-zero when the URL is unset or the POST fails. While it is
+unset, `hs-release status` and every non-zero `hs-release` exit print a warning line. When a `blocked` marker exists the
+alert says that the backend and scheduler are stopped on purpose. `homeserver/ops/` has no shared alert channel to reuse
 (`hs-caretaker` raises Trinity notifications, which needs its token and a working backend; this alert must work when the
 backend is the thing that failed).
 

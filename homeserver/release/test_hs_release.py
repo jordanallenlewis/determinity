@@ -72,6 +72,10 @@ img_for() {
   [ -n "$r" ] && echo "$r" || echo "ghcr.io/abilityai/trinity-$1:v1.0.5"
 }
 case "$1" in
+  tag)
+    # Was the in-flight note written before the box was changed?
+    if [ -f "$HS_RELEASE_STATE/inflight" ]; then echo "inflight-at-tag" >> "$FAKE_LOG"; else echo "no-inflight-at-tag" >> "$FAKE_LOG"; fi
+    exit 0 ;;
   pull)
     # PULL_FAIL: a substring of the ref whose pull fails.
     if [ -n "$PULL_FAIL" ]; then case "$*" in *"$PULL_FAIL"*) exit 1 ;; esac; fi
@@ -81,13 +85,14 @@ case "$1" in
     case "$fmt" in
       '{{.Config.Image}}') img_for "$id" ;;
       '{{.State.Running}} {{.RestartCount}}')
+        [ "$id" = "$RECREATE_SVC" ] && touch "$FAKE_DIR/recreate_now"
         rel=$(sed -n 's/^DETERMINITY_RELEASE=//p' "$TRINITY_DIR/release.env" 2>/dev/null)
         c="$FAKE_DIR/rc_$id"; [ -f "$c" ] || echo 0 > "$c"
         if [ "$id" = "$CRASH_SVC" ] && { [ -z "$CRASH_TAG" ] || [ "$rel" = "$CRASH_TAG" ]; }; then
           echo $(( $(cat "$c") + 1 )) > "$c"
         fi
         echo "true $(cat "$c")" ;;
-      *) echo "id:$(img_for "$id")" ;;
+      *) if [ "$id" = "$STALE_SVC" ]; then echo "id:stale-image"; else echo "id:$(img_for "$id")"; fi ;;
     esac ;;
   image)
     if [ "$4" = '{{json .RepoDigests}}' ]; then
@@ -116,14 +121,28 @@ case "$1" in
     # `config --format json`: the backend's effective DATABASE_URL. NO_PG = empty
     # (SQLite), DB_URL = whatever is set there, else the bundled default.
     [ -n "$CONFIG_FAIL" ] && exit 1
-    if [ -n "$NO_PG" ]; then u=""; elif [ -n "$DB_URL" ]; then u="$DB_URL"; else u="postgresql://trinity@postgres:5432/trinity"; fi
-    printf '{"services":{"backend":{"environment":{"DATABASE_URL":"%s"}},"postgres":{}}}\n' "$u" ;;
-  ps) [ "$3" = postgres ] && [ -n "$NO_PG$DB_URL" ] && exit 0; echo "$3" ;;
+    # URL_MODE: empty / null / missing (key absent) / nobackend (no backend service).
+    if [ -n "$NO_PG" ]; then u="sqlite:////data/trinity.db"; elif [ -n "$DB_URL" ]; then u="$DB_URL"; else u="postgresql://trinity@postgres:5432/trinity"; fi
+    pgdb="${PG_DBNAME:-trinity}"
+    case "$URL_MODE" in
+      empty) be='{"environment":{"DATABASE_URL":""}}' ;;
+      null) be='{"environment":{"DATABASE_URL":null}}' ;;
+      missing) be='{"environment":{"OTHER":"x"}}' ;;
+      nobackend) be="" ;;
+      *) be="{\"environment\":{\"DATABASE_URL\":\"$u\"}}" ;;
+    esac
+    if [ -n "$be" ]; then be="\"backend\":$be,"; fi
+    printf '{"services":{%s"postgres":{"environment":{"POSTGRES_DB":"%s","POSTGRES_USER":"trinity"}}}}\n' "$be" "$pgdb" ;;
+  ps)
+    [ "$3" = postgres ] && [ -n "$PG_DOWN" ] && exit 0
+    # RECREATE_SVC: once a State inspect has run (the soak snapshot), this service answers with a new container id.
+    if [ "$3" = "$RECREATE_SVC" ] && [ -f "$FAKE_DIR/recreate_now" ]; then echo "$3-new"; exit 0; fi
+    echo "$3" ;;
   up) exit "${UP_FAIL:-0}" ;;
   exec)
     script="$*"
     case "$script" in
-      *pg_dump*) [ -n "$DUMP_FAIL" ] && exit 1; [ -n "$DUMP_EMPTY" ] && exit 0; echo "PGDMP rev=$(rev)" ;;
+      *pg_dump*) [ -n "$DUMP_FAIL" ] && exit 1; [ -n "$DUMP_EMPTY" ] && exit 0; [ -n "$DUMP_BAD" ] && { echo "NOTADUMP rev=$(rev)"; exit 0; }; echo "PGDMP rev=$(rev)" ;;
       *alembic_version*)
         [ -n "$REV_FAIL" ] && exit 1
         if [ -n "$REV_FAIL_TAG" ] && [ ! -f "$FAKE_DIR/rev_override" ]; then
@@ -133,7 +152,7 @@ case "$1" in
         [ -n "$REV_ROWS" ] && { echo rev1; echo rev2; exit 0; }
         rev ;;
       *"DROP SCHEMA"*) echo dropped >> "$FAKE_LOG" ;;
-      *pg_restore*) [ -n "$RESTORE_FAIL" ] && exit 1; sed -n 's/^PGDMP rev=//p' > "$FAKE_DIR/rev_override" ;;
+      *pg_restore*) [ -n "$RESTORE_FAIL" ] && exit 1; [ -n "$RESTORE_WRONG_REV" ] && { echo revX > "$FAKE_DIR/rev_override"; exit 0; }; sed -n 's/^PGDMP rev=//p' > "$FAKE_DIR/rev_override" ;;
     esac ;;
 esac
 exit 0
@@ -179,10 +198,13 @@ class HsReleaseTest(unittest.TestCase):
             COMPOSE="fake-compose",
             FAKE_WEB=self.web,
             FAKE_LOG=self.log,
+            HS_RELEASE_ALERT_URL="http://alert.test/default",   # tests of the unset case pass ""
             **{k: "" for k in ("BAD_TAG", "BAD_FRONTEND", "BAD_MCP", "BAD_SETUP", "CRASH_SVC", "CRASH_TAG",
                                "MIGRATES_TAG", "NO_PG", "DUMP_FAIL", "DUMP_EMPTY", "REV_FAIL", "ALERT_FAIL",
                                "PULL_FAIL", "NO_DIGEST", "RESTORE_FAIL", "DB_URL", "CONFIG_FAIL",
-                               "REV_FAIL_TAG", "REV_ROWS", "HS_RELEASE_EXTERNAL_DB")},
+                               "REV_FAIL_TAG", "REV_ROWS", "HS_RELEASE_EXTERNAL_DB", "URL_MODE", "PG_DBNAME",
+                               "PG_DOWN", "RECREATE_SVC", "STALE_SVC", "DUMP_BAD", "RESTORE_WRONG_REV",
+                               )},
         )
 
     def tearDown(self):
@@ -194,7 +216,7 @@ class HsReleaseTest(unittest.TestCase):
             f.write(body if isinstance(body, str) else json.dumps(body))
 
     def publish(self, tag, latest=True, prerelease=False, draft=False, contract=None,
-                author="github-actions[bot]", agent=False, refs=None, asset=None,
+                author="github-actions[bot]", uploader="github-actions[bot]", agent=False, refs=None, asset=None,
                 published_at="2020-01-01T00:00:00Z", homeserver_files=None):
         asset = asset or f"https://github.com/owner/determinity/releases/download/{tag}/release.json"
         images = {s: {"ref": f"ghcr.io/owner/determinity-{s}@{digest(tag, s)}"} for s in SERVICES}
@@ -209,7 +231,8 @@ class HsReleaseTest(unittest.TestCase):
             rel["homeserver_files"] = homeserver_files
         meta = {"tag_name": tag, "draft": draft, "prerelease": prerelease, "published_at": published_at,
                 "author": {"login": author},
-                "assets": [{"name": "release.json", "browser_download_url": asset}]}
+                "assets": [{"name": "release.json", "browser_download_url": asset,
+                            "uploader": {"login": uploader}}]}
         self.serve(asset, rel)
         self.serve(f"{API}/repos/owner/determinity/releases/tags/{tag}", meta)
         if latest:
@@ -1182,7 +1205,7 @@ class HsReleaseTest(unittest.TestCase):
         self.assertIn("ROLLBACK ALSO UNHEALTHY", self.calls())
 
     def test_m4_alert_without_a_url_writes_the_journal_at_err(self):
-        r = self.run_alert()
+        r = self.run_alert(HS_RELEASE_ALERT_URL="")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("logger -p daemon.err -t hs-release-alert", self.calls())
         self.assertNotIn("curl-post", self.calls())
@@ -1197,6 +1220,250 @@ class HsReleaseTest(unittest.TestCase):
             unit = f.read()
         self.assertIn("OnFailure=hs-release-alert.service", unit)
         self.assertNotIn("SuccessExitStatus", unit)
+
+
+    # ---- round 4
+    def r4_blocked(self, **env):
+        r = self.blocked_by_migration(**env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        return r
+
+    def pinned_size(self):  # nothing was pinned: release.env is absent or empty
+        p = os.path.join(self.trinity, "release.env")
+        return os.path.getsize(p) if os.path.exists(p) else 0
+
+    def r4_dump(self):
+        return [l for l in self.state_file("blocked").split("\n") if l.startswith("backup=")][0][7:]
+
+    def test_r4_blocked_says_the_services_are_stopped(self):
+        r = self.r4_blocked()
+        self.assertIn("services_stopped=backend scheduler", self.state_file("blocked"))
+        self.assertIn("services_stopped=backend scheduler", r.stderr)
+        self.assertIn("NOT serving", r.stderr)
+        self.assertNotIn("compose up -d --no-build backend", self.calls().split("compose stop backend scheduler")[-1])
+        st = self.run_cmd("status")
+        self.assertIn("BLOCKED", st.stdout)
+        self.assertIn("services stopped: backend scheduler", st.stdout)
+        alert = self.run_alert(HS_RELEASE_ALERT_URL="http://alert.test/topic")
+        self.assertIn("stopped on purpose", self.calls())
+
+    def test_r4_apply_the_pinned_tag_while_blocked_reruns_the_gate(self):
+        self.r4_blocked()
+        # Still failing: stays blocked, exit 3, services stopped again.
+        r = self.run_cmd("apply", self.T2, BAD_TAG=self.T2, MIGRATES_TAG=self.T2)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn("already on", r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T2)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "inflight")))
+        # Healthy now: services started, gate passes, blocked cleared.
+        n = self.calls().count("compose up -d")
+        r = self.run_cmd("apply", self.T2, MIGRATES_TAG=self.T2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreater(self.calls().count("compose up -d"), n)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertEqual(self.current()["DETERMINITY_RELEASE"], self.T2)
+
+    def test_r4_clear_broken_while_blocked_points_at_the_right_command(self):
+        self.r4_blocked()
+        r = self.run_cmd("clear-broken")
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn("nothing to clear", r.stdout)
+        self.assertIn("rollback --restore-db", r.stdout)
+        self.assertIn("apply " + self.T2, r.stdout)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
+
+    def test_r4_plain_rollback_that_passes_the_gate_clears_blocked(self):
+        self.r4_blocked()
+        with open(os.path.join(self.tmp, "rev_override"), "w") as f:
+            f.write("rev1\n")   # the database is back at the schema T1 ran on
+        r = self.run_cmd("rollback")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertNotEqual(self.run_cmd("apply").returncode, 3)
+
+    def test_r4_person_applies_an_older_tag_and_the_timer_stays(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T3)  # latest
+        r = self.run_cmd("apply", self.T1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+        self.assertIn("hs-release apply " + self.T3, r.stderr)
+        r = self.run_cmd("apply")   # the timer
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("refused/held here", r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+        # A person can still go forward, which lifts the hold.
+        self.assertEqual(self.run_cmd("apply", self.T3).returncode, 0)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T3)
+
+    def test_r4_person_applying_the_latest_adds_no_hold(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply", self.T1).returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "refused")) and self.state_file("refused").strip())
+
+    def test_r4_db_url_parsing(self):
+        bundled = ["postgresql://u:p~postgres:5432/trinity", "postgresql+psycopg2://u~postgres/trinity",
+                   "postgres://u:p~postgres:5432/trinity"]
+        external = ["postgresql://u:p~postgres:5432/otherdb",
+                    "postgresql://u:p~db.example.com/x?host=~postgres/",
+                    "postgresql://u:p~db.example.com/trinity?host=postgres",
+                    "postgresql://u:a~postgres:b~db.example.com:5432/trinity",
+                    "postgresql://u:p~postgres:5433/trinity",
+                    "postgresql://u:p~postgresx/trinity"]
+        # written with ~ for @ so the fixtures do not read as credentials to scanners
+        bundled = [u.replace("~", "@") for u in bundled]
+        external = [u.replace("~", "@") for u in external]
+        self.publish(self.T1)
+        for url in bundled:
+            shutil.rmtree(self.state, ignore_errors=True)
+            r = self.run_cmd("apply", DB_URL=url)
+            self.assertEqual(r.returncode, 0, (url, r.stderr))
+            self.assertIn("database backed up", r.stderr, url)
+            os.remove(os.path.join(self.trinity, "release.env"))
+        for url in external:
+            shutil.rmtree(self.state, ignore_errors=True)
+            open(self.log, "w").close()
+            r = self.run_cmd("apply", DB_URL=url)
+            self.assertEqual(r.returncode, 1, (url, r.stderr))
+            self.assertIn("external database", r.stderr, url)
+            self.assertNotIn("compose up", self.calls(), url)
+            self.assertEqual(self.pinned_size(), 0, url)
+        r = self.run_cmd("apply", DB_URL="postgresql://u@postgres:5432/other", PG_DBNAME="other")
+        self.assertEqual(r.returncode, 0, r.stderr)   # the bundled name is read from compose
+
+    def test_r4_empty_database_url_is_sqlite(self):
+        # upstream's documented switch: DATABASE_URL set but empty keeps SQLite
+        self.publish(self.T1)
+        r = self.run_cmd("apply", URL_MODE="empty")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("pg_dump", self.calls())
+
+    def test_r4_missing_or_null_database_url_is_refused(self):
+        self.publish(self.T1)
+        for mode in ("null", "missing", "nobackend"):
+            shutil.rmtree(self.state, ignore_errors=True)
+            open(self.log, "w").close()
+            r = self.run_cmd("apply", URL_MODE=mode)
+            self.assertEqual(r.returncode, 1, (mode, r.stderr))
+            self.assertIn("no DATABASE_URL", r.stderr, mode)
+            self.assertNotIn("compose up", self.calls(), mode)
+            self.assertEqual(self.pinned_size(), 0, mode)
+
+    def test_r4_external_rollback_needs_db_restored(self):
+        env = dict(DB_URL="postgresql://u@db.example.test:5432/trinity",
+                   HS_RELEASE_EXTERNAL_DB="own-backups-no-rollback-across-migration")
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply", **env).returncode, 0)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply", **env).returncode, 0)
+        r = self.run_cmd("rollback", **env)   # healthy, not blocked: still refused
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--db-restored", r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T2)
+        r = self.run_cmd("rollback", "--db-restored", **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+
+    # mutation tests: each fails when its check is deleted or inverted
+    def test_r4_gate_refuses_a_service_not_running_the_pinned_image(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", STALE_SVC="frontend")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("health: frontend runs", r.stderr)
+
+    def test_r4_gate_reads_the_alembic_revision(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        r = self.run_cmd("apply", REV_FAIL_TAG=self.T2)   # /health and the rest answer; only the read fails
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("health: cannot read alembic_version", r.stderr)
+
+    def test_r4_soak_catches_a_recreated_container(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", RECREATE_SVC="scheduler")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("scheduler was recreated during", r.stderr)
+
+    def test_r4_restore_checks_the_restored_revision(self):
+        self.r4_blocked()
+        r = self.run_cmd("rollback", "--restore-db", MIGRATES_TAG=self.T2, RESTORE_WRONG_REV="1")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("not at schema rev1", self.state_file("broken"))
+        self.assertTrue(os.path.exists(os.path.join(self.state, "broken")))
+
+    def test_r4_dump_without_the_custom_format_header_is_refused(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", DUMP_BAD="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("database backup failed", r.stderr)
+        self.assertEqual(self.pinned_size(), 0)
+        self.assertEqual([f for f in os.listdir(os.path.join(self.state, "backups"))], [])
+
+    def test_r4_bundled_postgres_not_running_is_refused(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", PG_DOWN="1")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bundled postgres service is not running", r.stderr)
+        self.assertNotIn("compose up", self.calls())
+
+    # ---- alert URL
+    def test_r4_status_and_loud_exits_warn_when_no_alert_url(self):
+        self.assertIn("HS_RELEASE_ALERT_URL is not set", self.run_cmd("status", HS_RELEASE_ALERT_URL="").stdout)
+        self.assertNotIn("HS_RELEASE_ALERT_URL is not set", self.run_cmd("status", HS_RELEASE_ALERT_URL="http://a.test/t").stdout)
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        r = self.run_cmd("apply", BAD_TAG=self.T2, MIGRATES_TAG=self.T2, HS_RELEASE_ALERT_URL="")   # exit 3
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("HS_RELEASE_ALERT_URL is not set", r.stderr)
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 3)
+        self.assertNotIn("HS_RELEASE_ALERT_URL is not set", r.stderr)
+        r = self.run_cmd("check", HS_RELEASE_ALERT_URL="")   # exit 0 / 10 are not loud
+        self.assertNotIn("HS_RELEASE_ALERT_URL is not set", r.stderr)
+
+    def test_r4_alert_test_mode(self):
+        alert = os.path.join(HERE, "hs-release-alert")
+        r = subprocess.run([alert, "--test"], env=dict(self.env, HS_RELEASE_ALERT_URL=""), capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not set", r.stderr)
+        self.assertFalse(os.path.exists(self.log) and "curl-post" in self.calls())
+        r = subprocess.run([alert, "--test"], env=dict(self.env, HS_RELEASE_ALERT_URL="http://alert.test/topic"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("curl-post http://alert.test/topic", self.calls())
+        r = subprocess.run([alert, "--test"], env=dict(self.env, HS_RELEASE_ALERT_URL="http://alert.test/topic", ALERT_FAIL="1"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(r.returncode, 0)
+
+    # ---- restore record, in-flight order, uploader
+    def test_r4_restore_record_names_the_backup_restored(self):
+        self.r4_blocked()
+        dump = self.r4_dump()
+        r = self.run_cmd("rollback", "--restore-db", MIGRATES_TAG=self.T2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RESTORED_FROM=" + dump, self.state_file("previous.meta"))
+        self.assertIn("database restored from " + dump, r.stderr)
+
+    def test_r4_inflight_note_is_written_before_the_agent_retag(self):
+        self.publish(self.T1, agent=True)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        c = self.calls()
+        self.assertIn("inflight-at-tag", c)
+        self.assertNotIn("no-inflight-at-tag", c)
+
+    def test_r4_release_json_uploaded_by_someone_else_is_refused(self):
+        self.publish(self.T1, uploader="someone-else")
+        r = self.run_cmd("apply")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("uploaded by 'someone-else'", r.stderr)
+        self.assertEqual(self.pinned_size(), 0)
 
 
 class DeterminityVersionTest(unittest.TestCase):

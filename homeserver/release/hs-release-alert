@@ -8,13 +8,32 @@
 # HS_RELEASE_ALERT_URL (in /etc/default/hs-release): the message is POSTed to it
 # as text/plain, which ntfy and most webhook receivers accept (Title header set).
 # Unset, or if the POST fails: the message goes to the journal at priority err.
+#
+#   hs-release-alert --test   send a test message to the alert URL; exits non-zero
+#                             when HS_RELEASE_ALERT_URL is unset or the POST fails.
+#                             A required install step (RELEASES.md, "Install").
 set -euo pipefail
 
 STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
 host=$(hostname)
 msg="hs-release on $host did not finish cleanly (rolled back, schema moved, broken, or an error). Last log lines:
 $(tail -n 8 "$STATE/log" 2>/dev/null || echo '(no log)')
+$(if [ -f "$STATE/blocked" ]; then echo "BLOCKED: the failed release $(sed -n 's/^tag=//p' "$STATE/blocked") is pinned and its backend and scheduler are stopped on purpose (services_stopped=$(sed -n 's/^services_stopped=//p' "$STATE/blocked")): the app is down until a person acts."; fi)
 Next steps: hs-release status; see RELEASES.md, \"Rolling back\"."
+
+if [ "${1:-}" = --test ]; then
+  if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then
+    echo "hs-release-alert: HS_RELEASE_ALERT_URL is not set (/etc/default/hs-release); a failed hs-release run would only reach the journal" >&2
+    exit 1
+  fi
+  if ! curl -fsS -m 20 -H "Title: hs-release on $host (test)" -H 'Priority: default' \
+       -H 'Content-Type: text/plain' --data-binary "hs-release alert test from $host: if you can read this, failed runs will reach you." "$HS_RELEASE_ALERT_URL" >/dev/null; then
+    echo "hs-release-alert: the test message could not be posted to the alert URL" >&2
+    exit 1
+  fi
+  echo "hs-release-alert: test message sent"
+  exit 0
+fi
 
 to_journal() { printf '%s\n' "$msg" | logger -p daemon.err -t hs-release-alert; }
 

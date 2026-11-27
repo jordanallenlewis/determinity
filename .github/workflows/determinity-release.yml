@@ -20,9 +20,14 @@ name: Determinity release
 # Determinity tag by hand: that would start them.
 #
 # Order is what keeps a half-finished release invisible: images first (by
-# version tag), then the tag + Release + release.json, then `latest` on the
-# images. A failure before the Release leaves no tag and no Release; re-running
-# picks the same version again.
+# version tag), then the tag + draft Release + release.json, then publish, then
+# `latest` on the images. A failure before the tag leaves no tag and no
+# Release; a fresh run picks the same version again. A failure after the tag
+# can only be finished with "Re-run failed jobs" on the same run (within 30
+# days): a fresh run stops in `plan` with "HEAD is already released". The
+# release job resumes only its own work: a tag on this revision, and a Release
+# for that tag whose release.json names this revision. Anything else under
+# that tag stops it.
 
 on:
   workflow_dispatch:
@@ -77,8 +82,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Release names too (drafts included), so a number is not reused when
-          # a tag was deleted but its Release was not.
+          # Published Release names too, so a number is not reused when a tag
+          # was deleted but its Release was not. This read-only token does not
+          # see drafts; the release job checks them again with its write token
+          # before it creates anything.
           DETERMINITY_KNOWN_TAGS=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
           export DETERMINITY_KNOWN_TAGS
           out=$(homeserver/release/determinity-version)
@@ -563,13 +570,32 @@ jobs:
           cat notes.md
 
       - name: Create the tag and the Release
+        id: publish
         if: env.DRY != 'true'
         run: |
           set -euo pipefail
           # Order: tag (checked) -> draft Release -> release.json (checked) ->
-          # publish as latest. Nothing a server reads exists before every check
-          # has passed. Re-runnable: a tag on this revision and a draft from an
-          # earlier attempt are reused; a published Release is never rewritten.
+          # publish. Nothing a server reads exists before every check has
+          # passed. Re-runnable: a tag on this revision and a Release from an
+          # earlier attempt of this release are reused; a published Release is
+          # never rewritten.
+
+          # Existing Releases under this tag, drafts included (the plan job's
+          # read-only token cannot see drafts). Deleting a published Release's
+          # tag turns it into a draft, so a draft can be an old release whose
+          # number would otherwise be handed out again. Only a Release whose
+          # release.json names this revision is ours to finish.
+          gh api --paginate "repos/${REPO}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${TAG}\" or .name == \"Determinity ${TAG}\") | .id" > same-name.txt
+          while read -r rid; do
+            [ -n "$rid" ] || continue
+            aid=$(gh api "repos/${REPO}/releases/${rid}" --jq '[.assets[] | select(.name == "release.json") | .id][0] // empty')
+            [ -n "$aid" ] || { echo "::error::Release ${rid} for ${TAG} exists without release.json; the number may have been used. Not touching it"; exit 1; }
+            rev=$(gh api -H 'Accept: application/octet-stream' "repos/${REPO}/releases/assets/${aid}" | jq -r '.revision // empty')
+            [ "$rev" = "$REVISION" ] || { echo "::error::Release ${rid} for ${TAG} was cut from ${rev:-an unknown revision}, not ${REVISION}; this version is taken"; exit 1; }
+          done < same-name.txt
+          [ "$(wc -l < same-name.txt)" -le 1 ] || { echo "::error::more than one Release for ${TAG}"; exit 1; }
+
           if sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null); then
             echo "tag $TAG exists at $sha"
           else
@@ -606,7 +632,19 @@ jobs:
           [ "$author" = "github-actions" ] || [ "$author" = "github-actions[bot]" ] \
             || { echo "::error::Release $TAG author is '$author'; servers accept only github-actions[bot]"; exit 1; }
 
+          # A re-run of an older release (or two releases finishing out of
+          # order) must not move `latest` back: fresh installs would get the
+          # older one. Publish it, but leave latest where it is.
+          cur=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$cur" ] && [ "$cur" != "$TAG" ] \
+             && [ "$(printf '%s\n' "$cur" "$TAG" | sort -V | tail -1)" = "$cur" ]; then
+            echo "::warning::releases/latest is $cur, newer than $TAG; publishing $TAG without moving latest"
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest=false
+            echo "move_latest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          echo "move_latest=true" >> "$GITHUB_OUTPUT"
           # releases/latest can lag the publish by a few seconds.
           got=
           for _ in 1 2 3 4 5 6; do
@@ -617,7 +655,7 @@ jobs:
           [ "$got" = "$TAG" ] || { echo "::error::releases/latest is '$got', expected '$TAG'"; exit 1; }
 
       - name: Move latest on the images
-        if: env.DRY != 'true'
+        if: env.DRY != 'true' && steps.publish.outputs.move_latest == 'true'
         run: |
           set -euo pipefail
           while read -r img name digest; do
