@@ -55,3 +55,10 @@ Mutation:
 ## Screenshots (if applicable)
 
 Add screenshots to help explain your changes.
+
+## Determinity: guide and README
+
+<!-- Fork-only section, kept at the end of the template so the daily upstream sync merges around it. -->
+
+- [ ] Does this change the guide? If yes, link the guide PR:
+- [ ] If this adds, changes or removes a difference from upstream Trinity, the README's "What's different" table is updated in this PR.

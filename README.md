@@ -1,12 +1,38 @@
-<!-- Determinity: fork section. Everything from the divider down is upstream's README, unchanged. -->
+<!-- Determinity: fork section, laid out on upstream Trinity's README (hero, links, badges, note, sections). Everything below the divider is upstream's README, unchanged. -->
+<!-- slot:hero -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="homeserver/assets/determinity-hero-dark.webp">
+    <img src="homeserver/assets/determinity-hero-light.webp" alt="Determinity: the deterministic layer for Trinity, a fork of Trinity by Ability.ai" width="100%" />
+  </picture>
+</p>
+<p align="center"><strong>A hardened home-server layer for Trinity.</strong> A fork of <a href="https://github.com/abilityai/trinity">Trinity</a> by Ability.ai.</p>
+<!-- /slot:hero -->
 
-# Determinity: a hardened home-server layer for Trinity
+<p align="center">
+  <a href="#why-i-forked-it"><strong>Why</strong></a> &middot;
+  <a href="#whats-different"><strong>What's different</strong></a> &middot;
+  <a href="#how-it-tracks-upstream"><strong>Tracking upstream</strong></a> &middot;
+  <a href="https://jordanallenlewis.com/posts/trinity-ai-agents-setup-guide?utm_source=github&utm_medium=readme&utm_campaign=determinity&utm_content=top-banner"><strong>Read the full write-up</strong></a> &middot;
+  <a href="https://github.com/abilityai/trinity"><strong>Upstream Trinity</strong></a> &middot;
+  <a href="https://docs.ability.ai"><strong>Trinity docs</strong></a>
+</p>
 
-[![Fork of abilityai/trinity](https://img.shields.io/badge/fork%20of-abilityai%2Ftrinity-blue?logo=github)](https://github.com/abilityai/trinity)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+<!-- slot:badges -->
+<p align="center">
+  <a href="https://github.com/abilityai/trinity"><img src="https://img.shields.io/badge/fork%20of-abilityai%2Ftrinity-blue?logo=github" alt="Fork of abilityai/trinity"></a>
+  <a href="https://github.com/abilityai/trinity/releases"><img src="https://img.shields.io/github/v/release/abilityai/trinity?label=upstream%20release" alt="Upstream release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
+  <!-- slot:badges-owner (off for now)
+  <a href="../../actions/workflows/hq-upstream-sync.yml"><img src="https://github.com/<OWNER>/determinity/actions/workflows/hq-upstream-sync.yml/badge.svg" alt="Upstream sync"></a>
+  <a href="../../stargazers"><img src="https://img.shields.io/github/stars/<OWNER>/determinity?style=flat" alt="Stars"></a>
+  /slot:badges-owner -->
+</p>
+<!-- /slot:badges -->
 
-**Determinity is a fork of [Trinity](https://github.com/abilityai/trinity) by [Ability.ai](https://www.ability.ai/trinity) (Apache 2.0).**
-For the platform itself, its documentation and its support, go upstream: [github.com/abilityai/trinity](https://github.com/abilityai/trinity) and [docs.ability.ai](https://docs.ability.ai). This fork adds a layer around Trinity. It does not replace it.
+> [!NOTE]
+> **Determinity is a fork of [Trinity](https://github.com/abilityai/trinity) by [Ability.ai](https://www.ability.ai/trinity) (Apache 2.0).**
+> For the platform itself, its documentation and its support, go upstream: [github.com/abilityai/trinity](https://github.com/abilityai/trinity) and [docs.ability.ai](https://docs.ability.ai). This fork adds a layer around Trinity. It does not replace it.
 
 ## Why I forked it
 
@@ -16,6 +42,10 @@ The name is deterministic + Trinity.
 
 ## What's different
 
+<!-- slot:diagram (until the diagram lands: nothing; then a light/dark <picture> from homeserver/assets/) -->
+<!-- /slot:diagram -->
+
+<!-- determinity:differences:start (one row per difference from upstream; checked against the setup guide) -->
 | Area | Upstream Trinity | Determinity |
 |---|---|---|
 | [Gateway](homeserver/gateway/) | Agents call devices, accounts and APIs directly, with the credentials and MCP servers you give them. | A gateway holds those credentials and offers named actions, each checked against the calling agent's allow-list. For a write to a device or account the gateway raises the Trinity operator-queue ask itself, in its own words with the exact parameters (secret ones, such as a door code, shown only as hidden), and the call goes through only after a person approves that ask, once. Anything it can't check is refused. |
@@ -27,25 +57,26 @@ The name is deterministic + Trinity.
 | [Stuck-threshold patch](homeserver/patches/) | The business health check calls a run stuck after a fixed 30 minutes and ignores the configured `stuck_execution_threshold` (upstream `main`, 2026-11-24). | A patch applied when the backend starts makes the check honour the setting. It does nothing once upstream changes those lines. |
 | [Caddy and sign-in gate](homeserver/caddy/) | The platform serves its web UI and API with its own login. | Caddy terminates TLS in front of the platform, admits only allowed address ranges, and puts a forward-auth sign-in gate (TinyAuth) before Trinity's own login. |
 | CI image build and upstream sync ([images](.github/workflows/hq-images.yml), [sync](.github/workflows/hq-upstream-sync.yml)) | Upstream is the source and publishes its own releases. | Every push to `hq` builds the four platform images and publishes them to this fork's GHCR namespace. A daily job merges upstream's latest release (see below). |
+| Grid pan fix (commit 4e063f97) | Pressing on selected text in the Grid canvas could start a browser drag instead of a pan (v1.0.5). | The fix, carried until an upstream release includes it. |
+<!-- determinity:differences:end -->
+
+Each difference is a separate, self-contained change, and everything under `homeserver/` is opt-in. When an upstream release includes the same change, its row and the fork's copy are removed. A pull request that adds, changes or removes a difference updates this table in the same pull request.
 
 ## How it tracks upstream
 
 - **A daily sync.** [`hq-upstream-sync.yml`](.github/workflows/hq-upstream-sync.yml) merges upstream's latest release tag into `hq`, the default branch. Before it pushes, it gates the merge on a frontend build and a backend compile. If the merge conflicts or the gate fails, it opens a pull request for me to fix and pushes nothing.
-- **Upstream files stay as upstream wrote them.** There are three exceptions: this section of the README, the lines added at the end of `NOTICE`, and a UI fix from upstream [#4669](https://github.com/abilityai/trinity/pull/4669). Upstream has already merged that fix, and the sync drops it here once a release includes it.
+- **Upstream files stay as upstream wrote them.** There are four exceptions: this section of the README, the lines added at the end of `NOTICE`, a short Determinity section at the end of the pull request template, and a UI fix from upstream [#4669](https://github.com/abilityai/trinity/pull/4669). Upstream has already merged that fix into `dev`, and the sync drops it here once a release includes it.
 - **Everything Determinity adds lives under [`homeserver/`](homeserver/)**, plus the two `hq-*` workflows. Upstream has no such folder, so the sync can't conflict there.
-
-## The write-up
-
-For how the whole setup is built and run, step by step, with what went wrong along the way, see [Self-hosted AI agent platform: a Trinity setup guide](https://jordanallenlewis.com/posts/trinity-ai-agents-setup-guide?utm_source=github&utm_medium=readme&utm_campaign=determinity&utm_content=why-section).
 
 ## Status and support
 
 This is a personal project, shared as-is, with no warranty (see [LICENSE](LICENSE), sections 7 and 8). Issues about anything under `homeserver/` are welcome here. For Trinity itself, use [upstream's issues](https://github.com/abilityai/trinity/issues) and [docs](https://docs.ability.ai).
 
+<sub>README layout after upstream Trinity's own README.</sub>
+
 ---
 
 <sub>Below this line is upstream Trinity's README, unchanged.</sub>
-
 
 <p align="center">
   <a href="https://www.ability.ai/trinity">
