@@ -19,9 +19,16 @@ draft): a Release under the new tag whose `release.json` names another revision,
 the release.
 
 A release that failed after its tag was created is finished with **Re-run failed jobs** on the same run (within 30
-days); a fresh run stops with "HEAD is already released". A re-run resumes only its own tag and Release. If a newer
-release is already `latest`, an older one that finishes late is published without moving `latest` on the Release or
-the images.
+days); a fresh run stops with "HEAD is already released". A person with write access on the repository clicks the
+re-run; automation does not re-run release runs. A re-run resumes only its own tag and Release, and its image jobs stop
+when the tag is already on another revision (a later run took the number). If a newer release is already `latest`, an
+older one that finishes late is published without moving `latest` on the Release or the images; if `latest` cannot be
+read, the run stops before publishing and a re-run finishes it.
+
+After 30 days GitHub no longer offers the re-run. Leave the tag and the draft Release as they are (the number stays
+used; servers never read a draft) and release again from a new commit on `hq`: the next run takes the next number.
+A draft without `release.json` that an earlier attempt of the same release left behind (cancelled while creating or
+uploading) stops every re-run; a person deletes that draft Release, not the tag, and re-runs the failed jobs.
 A new Trinity release that the daily sync merges into `hq` starts a new release on its own. A Determinity-only change
 is released by running the **Determinity release** workflow on `hq` from the Actions tab.
 
@@ -110,14 +117,20 @@ install -m 0755 compose/trinity /usr/local/sbin/hs-trinity           # the compo
 cat > /etc/default/hs-release <<'CONF'
 TRINITY_DIR=/srv/trinity
 # BOX_BACKEND_PORT=8000  BOX_MCP_PORT=18080  FRONTEND_PORT=80   (only if not the defaults)
-HS_RELEASE_ALERT_URL=https://ntfy.example.com/hs-release          # REQUIRED, see "Alerts"; replace with your own topic
+# REQUIRED, see "Alerts"; replace with your own topic. Comments go on their own line: systemd reads the rest of a
+# line as the value, so a trailing comment would become part of the URL.
+HS_RELEASE_ALERT_URL=https://ntfy.example.com/hs-release
 # HS_RELEASE_MIN_AGE_HOURS=24   HS_RELEASE_AGENT_IMAGE=yes   (the defaults; see "Upgrading")
 # HS_RELEASE_EXTERNAL_DB=own-backups-no-rollback-across-migration   (only for an external PostgreSQL; see "Rolling back")
 # HS_RELEASE_FILES="homeserver/release/hs-release=/usr/local/sbin/hs-release ..."   (only if you install elsewhere)
 CONF
-hs-release-alert --test                                           # required: must print "test message sent" and reach you
-hs-release status                                                 # must not print "HS_RELEASE_ALERT_URL is not set"
-hs-release apply v1.0.5-determinity.1                             # the first switch, by hand, watched
+# Run both through systemd, so they read /etc/default/hs-release exactly as the units do:
+systemd-run --wait --pipe --quiet -p EnvironmentFile=/etc/default/hs-release /usr/local/sbin/hs-release-alert --test
+                                    # required: must print "test message sent" and the message must reach you
+systemd-run --wait --pipe --quiet -p EnvironmentFile=/etc/default/hs-release /usr/local/sbin/hs-release status
+                                    # must print no HS_RELEASE_ALERT_URL warning (unset or not a valid URL)
+hs-release apply <latest tag>       # the first switch, by hand, watched; <latest tag> is the Release marked
+                                    # "Latest" on the Releases page (an older tag puts a hold on latest)
 systemctl daemon-reload && systemctl enable --now hs-release.timer
 ```
 
@@ -167,12 +180,15 @@ was off is not made up at boot). The timer path is deliberately more careful tha
 - **Forward only:** it never moves to a release whose version is lower than what runs (upstream version first, then `<n>`,
   compared numerically: `v1.0.10-determinity.1` is newer than `v1.0.9-determinity.5`). A withdrawn or re-pointed
   `latest` therefore does not downgrade the box; a tag it cannot compare is not moved to either. Both are logged.
-- **Held releases** (failed here, or rolled back from) are skipped.
+- **Held releases** (failed the gate here, rolled back from, the latest when a person applied an older release, or held
+  with `hs-release hold <tag>`) are skipped.
 
 `hs-release apply <tag>` by a person ignores all three, with one consequence: when the tag is **older than the latest
 release**, `hs-release` holds the latest release (it prints how), so the timer does not move forward again the next
-night and undo the choice. Release the hold with `hs-release apply <latest tag>`, or by deleting the line from
-`/var/lib/hs-release/refused`. A release newer than that one is still followed by the timer. By hand: `hs-release check` (exit 10 means a
+night and undo the choice. A hold is lifted only by `hs-release apply <held tag>` (a person naming it), a rollback that
+lands on it, or deleting its line from `/var/lib/hs-release/refused`. A release newer than the held one is not held and
+the timer follows it once it is old enough. If the latest release cannot be read during that apply, no hold is set and
+`hs-release` prints a WARNING; hold it by hand: `hs-release hold <latest tag>`. By hand: `hs-release check` (exit 10 means a
 newer release exists), then `hs-release apply` or `hs-release apply <tag>`.
 
 `apply` refuses drafts, pre-releases, tags outside the scheme, releases not published by `github-actions[bot]`, a
@@ -210,14 +226,15 @@ alerts every day, not once), and `hs-release status` prints them first:
 
 | marker | exit | meaning | stops | cleared by |
 |---|---|---|---|---|
-| `/var/lib/hs-release/blocked` | 3 | the schema moved under a release that failed the gate; `release.env` keeps pinning the failed release and, on PostgreSQL, **backend and scheduler are left stopped** (the file says `services_stopped=backend scheduler`; the app is down until a person acts) | the timer path | `hs-release rollback --restore-db`; `hs-release apply <the pinned tag>` (starts the services and re-runs the gate; healthy clears it, failing leaves it, exit 3); or a person fixing forward with `apply <tag>` once that release is healthy |
-| `/var/lib/hs-release/broken` | 4 | the state is unknown: a release **and** its rollback both failed the gate (`double-failure`), a manual rollback or a restore failed (`rollback-failed`, `restore-failed`), or a run was killed or the host reset between switching and verifying (`interrupted`, found from the `inflight` note) | every `apply`, the timer's and `apply <tag>` | `hs-release clear-broken`, only |
+| `/var/lib/hs-release/blocked` | 3 | the schema moved under a release that failed the gate; `release.env` keeps pinning the failed release and, on PostgreSQL, **backend and scheduler are left stopped** (the file says `services_stopped=backend scheduler`; the app is down until a person acts) | the timer path | `hs-release rollback --restore-db`; `hs-release apply <the pinned tag>` (checks the database first, then starts the services and re-runs the gate; healthy clears it; failing leaves it, exit 3, and on the bundled PostgreSQL stops backend and scheduler again; on an external database nothing is stopped and the file says `services_stopped=none`; if that stop fails the state is `broken` too, `services_stopped=FAILED`, exit 4: stop them by hand, then `rollback --restore-db`); or a person fixing forward with `apply <tag>` once that release is healthy. `clear-broken` does not lift it (it exits 3 while `blocked` stays) |
+| `/var/lib/hs-release/broken` | 4 | the state is unknown: a release **and** its rollback both failed the gate (`double-failure`), a manual rollback or a restore failed (`rollback-failed`, `restore-failed`), or a run was killed or the host reset between switching and verifying (`interrupted`, found from the `inflight` note), or the re-gate of a blocked release failed and backend and scheduler could not be stopped (`regate-stop-failed`) | every `apply`, the timer's and `apply <tag>` | `hs-release clear-broken`, only |
 
 `broken` holds a reason and a timestamp. While it exists `apply` does nothing and exits 4; `rollback` and
 `rollback --restore-db` still run, because they are the repair tools, but they do not clear it. Fix the platform, then
 run `hs-release clear-broken`: it runs the health gate on what `release.env` pins and clears the marker only if that
 passes (`--force` clears it without the gate). "Running" in `status`, and `current.env`, always equal what `release.env`
-pins; while `broken` is set `status` says "pinned in release.env: X (not verified healthy)", not "running".
+pins; while `broken` is set `status` says "pinned in release.env: X (not verified healthy)", and while `blocked` is set
+"pinned in release.env: X (failed the health gate, NOT a running release; services stopped: ...)", never "running".
 
 - **Automatic, schema unchanged:** a release that fails the gate is rolled back at once (exit 2, logged in
   `/var/lib/hs-release/log`; the agent image is re-tagged too). The timer does not try that release again;
@@ -291,7 +308,8 @@ a moved schema (3) and a broken state (4, every day until cleared), so every one
 unset, or the POST fails, it writes them to the journal at priority `err`
 (`journalctl -t hs-release-alert -p err`). Unset means nobody is told, so the install steps require it:
 `hs-release-alert --test` sends a test message and exits non-zero when the URL is unset or the POST fails. While it is
-unset, `hs-release status` and every non-zero `hs-release` exit print a warning line. When a `blocked` marker exists the
+unset, or set to something that is not a single `http(s)://` URL (a trailing comment in the file becomes part of the
+value), `hs-release status` and every non-zero `hs-release` exit print a warning line, and `--test` fails. When a `blocked` marker exists the
 alert says that the backend and scheduler are stopped on purpose. `homeserver/ops/` has no shared alert channel to reuse
 (`hs-caretaker` raises Trinity notifications, which needs its token and a working backend; this alert must work when the
 backend is the thing that failed).

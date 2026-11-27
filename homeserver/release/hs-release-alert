@@ -7,10 +7,13 @@
 #
 # HS_RELEASE_ALERT_URL (in /etc/default/hs-release): the message is POSTed to it
 # as text/plain, which ntfy and most webhook receivers accept (Title header set).
-# Unset, or if the POST fails: the message goes to the journal at priority err.
+# Unset, invalid, or if the POST fails: the message goes to the journal at priority err.
+# Valid = starts with http:// or https://, no whitespace, no #. (systemd's
+# EnvironmentFile only treats a line that STARTS with # as a comment, so a trailing
+# comment on the value ends up inside the URL.)
 #
 #   hs-release-alert --test   send a test message to the alert URL; exits non-zero
-#                             when HS_RELEASE_ALERT_URL is unset or the POST fails.
+#                             when HS_RELEASE_ALERT_URL is unset or invalid or the POST fails.
 #                             A required install step (RELEASES.md, "Install").
 set -euo pipefail
 
@@ -21,7 +24,23 @@ $(tail -n 8 "$STATE/log" 2>/dev/null || echo '(no log)')
 $(if [ -f "$STATE/blocked" ]; then echo "BLOCKED: the failed release $(sed -n 's/^tag=//p' "$STATE/blocked") is pinned and its backend and scheduler are stopped on purpose (services_stopped=$(sed -n 's/^services_stopped=//p' "$STATE/blocked")): the app is down until a person acts."; fi)
 Next steps: hs-release status; see RELEASES.md, \"Rolling back\"."
 
+url_problem() {  # why the URL is unusable; nothing when unset or fine
+  local u=${HS_RELEASE_ALERT_URL:-}
+  [ -n "$u" ] || return 0
+  case $u in
+    *[[:space:]]*) echo "it contains whitespace (a comment after the value? systemd does not strip it)" ;;
+    *'#'*) echo "it contains # (a comment after the value? systemd does not strip it)" ;;
+    http://?*|https://?*) ;;
+    *) echo "it does not start with http:// or https://" ;;
+  esac
+}
+bad_url=$(url_problem)
+
 if [ "${1:-}" = --test ]; then
+  if [ -n "$bad_url" ]; then
+    echo "hs-release-alert: HS_RELEASE_ALERT_URL is invalid: $bad_url. Put the value alone on its line in /etc/default/hs-release (a comment goes on its own line), then run --test again" >&2
+    exit 1
+  fi
   if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then
     echo "hs-release-alert: HS_RELEASE_ALERT_URL is not set (/etc/default/hs-release); a failed hs-release run would only reach the journal" >&2
     exit 1
@@ -38,6 +57,12 @@ fi
 to_journal() { printf '%s\n' "$msg" | logger -p daemon.err -t hs-release-alert; }
 
 if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then to_journal; exit 0; fi
+if [ -n "$bad_url" ]; then
+  to_journal
+  echo "HS_RELEASE_ALERT_URL is invalid ($bad_url); this alert was not posted and is only in the journal. Fix /etc/default/hs-release and run: hs-release-alert --test" | logger -p daemon.err -t hs-release-alert
+  echo "hs-release-alert: HS_RELEASE_ALERT_URL is invalid ($bad_url); wrote to the journal" >&2
+  exit 1
+fi
 if ! curl -fsS -m 20 -H "Title: hs-release on $host" -H 'Priority: high' \
      -H 'Content-Type: text/plain' --data-binary "$msg" "$HS_RELEASE_ALERT_URL" >/dev/null; then
   to_journal

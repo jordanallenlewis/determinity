@@ -15,7 +15,8 @@ import textwrap
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(HERE, "hs-release")
+SCRIPT = os.environ.get("HS_RELEASE_SCRIPT") or os.path.join(HERE, "hs-release")
+ALERT = os.environ.get("HS_RELEASE_ALERT_SCRIPT") or os.path.join(HERE, "hs-release-alert")
 SERVICES = ["backend", "frontend", "scheduler", "mcp-server"]
 API = "https://api.example.test"
 
@@ -123,7 +124,7 @@ case "$1" in
     [ -n "$CONFIG_FAIL" ] && exit 1
     # URL_MODE: empty / null / missing (key absent) / nobackend (no backend service).
     if [ -n "$NO_PG" ]; then u="sqlite:////data/trinity.db"; elif [ -n "$DB_URL" ]; then u="$DB_URL"; else u="postgresql://trinity@postgres:5432/trinity"; fi
-    pgdb="${PG_DBNAME:-trinity}"
+    pgdb="${PG_DBNAME:-trinity}"; [ -n "$PG_DBEMPTY" ] && pgdb=""
     case "$URL_MODE" in
       empty) be='{"environment":{"DATABASE_URL":""}}' ;;
       null) be='{"environment":{"DATABASE_URL":null}}' ;;
@@ -138,7 +139,11 @@ case "$1" in
     # RECREATE_SVC: once a State inspect has run (the soak snapshot), this service answers with a new container id.
     if [ "$3" = "$RECREATE_SVC" ] && [ -f "$FAKE_DIR/recreate_now" ]; then echo "$3-new"; exit 0; fi
     echo "$3" ;;
-  up) exit "${UP_FAIL:-0}" ;;
+  up)
+    # Was the in-flight note written before the services were started?
+    if [ -f "$HS_RELEASE_STATE/inflight" ]; then echo "inflight-at-up" >> "$FAKE_LOG"; else echo "no-inflight-at-up" >> "$FAKE_LOG"; fi
+    exit "${UP_FAIL:-0}" ;;
+  stop) [ -n "$STOP_FAIL" ] && exit 1; exit 0 ;;
   exec)
     script="$*"
     case "$script" in
@@ -203,7 +208,7 @@ class HsReleaseTest(unittest.TestCase):
                                "MIGRATES_TAG", "NO_PG", "DUMP_FAIL", "DUMP_EMPTY", "REV_FAIL", "ALERT_FAIL",
                                "PULL_FAIL", "NO_DIGEST", "RESTORE_FAIL", "DB_URL", "CONFIG_FAIL",
                                "REV_FAIL_TAG", "REV_ROWS", "HS_RELEASE_EXTERNAL_DB", "URL_MODE", "PG_DBNAME",
-                               "PG_DOWN", "RECREATE_SVC", "STALE_SVC", "DUMP_BAD", "RESTORE_WRONG_REV",
+                               "PG_DOWN", "STOP_FAIL", "PG_DBEMPTY", "RECREATE_SVC", "STALE_SVC", "DUMP_BAD", "RESTORE_WRONG_REV",
                                )},
         )
 
@@ -1192,7 +1197,7 @@ class HsReleaseTest(unittest.TestCase):
 
     # ---- M4: alerting
     def run_alert(self, **env):
-        alert = os.path.join(HERE, "hs-release-alert")
+        alert = ALERT
         os.makedirs(self.state, exist_ok=True)
         with open(os.path.join(self.state, "log"), "w") as f:
             f.write("2026-01-01T00:00:00Z hs-release: ROLLBACK ALSO UNHEALTHY\n")
@@ -1250,8 +1255,13 @@ class HsReleaseTest(unittest.TestCase):
     def test_r4_apply_the_pinned_tag_while_blocked_reruns_the_gate(self):
         self.r4_blocked()
         # Still failing: stays blocked, exit 3, services stopped again.
+        stops = self.calls().count("compose stop backend scheduler")
         r = self.run_cmd("apply", self.T2, BAD_TAG=self.T2, MIGRATES_TAG=self.T2)
         self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(self.calls().count("compose stop backend scheduler"), stops + 1)   # the stop after the failed re-gate
+        self.assertIn("inflight-at-up", self.calls())   # the in-flight note is written before the services start
+        self.assertNotIn("no-inflight-at-up", self.calls())
+        self.assertIn("services_stopped=backend scheduler", self.state_file("blocked"))
         self.assertNotIn("already on", r.stderr)
         self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
         self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T2)
@@ -1314,6 +1324,9 @@ class HsReleaseTest(unittest.TestCase):
                     "postgresql://u:p~db.example.com/trinity?host=postgres",
                     "postgresql://u:a~postgres:b~db.example.com:5432/trinity",
                     "postgresql://u:p~postgres:5433/trinity",
+                    "postgresql://u~postgres:5432/trinity?sslmode=disable",   # a query string: not the bundled one
+                    "postgresql://u~x:p~postgres:5432/trinity",   # a second @ in the user part
+                    "postgresql://u?x~postgres/trinity", "postgresql://u#x~postgres/trinity",
                     "postgresql://u:p~postgresx/trinity"]
         # written with ~ for @ so the fixtures do not read as credentials to scanners
         bundled = [u.replace("~", "@") for u in bundled]
@@ -1335,6 +1348,17 @@ class HsReleaseTest(unittest.TestCase):
             self.assertEqual(self.pinned_size(), 0, url)
         r = self.run_cmd("apply", DB_URL="postgresql://u@postgres:5432/other", PG_DBNAME="other")
         self.assertEqual(r.returncode, 0, r.stderr)   # the bundled name is read from compose
+        # A query string on the database name is not a name that matches, even when the service's name has it.
+        shutil.rmtree(self.state, ignore_errors=True)
+        os.remove(os.path.join(self.trinity, "release.env"))
+        r = self.run_cmd("apply", DB_URL="postgresql://u@postgres:5432/q?sslmode=disable", PG_DBNAME="q?sslmode=disable")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("external database", r.stderr)
+        # An empty POSTGRES_DB is never "the bundled database", even for a URL with an empty name.
+        r = self.run_cmd("apply", DB_URL="postgresql://u@postgres:5432/", PG_DBEMPTY="1")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("external database", r.stderr)
+        self.assertEqual(self.pinned_size(), 0)
 
     def test_r4_empty_database_url_is_sqlite(self):
         # upstream's documented switch: DATABASE_URL set but empty keeps SQLite
@@ -1429,7 +1453,7 @@ class HsReleaseTest(unittest.TestCase):
         self.assertNotIn("HS_RELEASE_ALERT_URL is not set", r.stderr)
 
     def test_r4_alert_test_mode(self):
-        alert = os.path.join(HERE, "hs-release-alert")
+        alert = ALERT
         r = subprocess.run([alert, "--test"], env=dict(self.env, HS_RELEASE_ALERT_URL=""), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not set", r.stderr)
@@ -1464,6 +1488,134 @@ class HsReleaseTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("uploaded by 'someone-else'", r.stderr)
         self.assertEqual(self.pinned_size(), 0)
+
+    # ---- round 5
+    def test_r5_a1_external_database_regate_never_stops_services(self):
+        ext = dict(DB_URL="postgresql://u~db.example.com/trinity".replace("~", "@"), HS_RELEASE_EXTERNAL_DB="own-backups-no-rollback-across-migration")
+        self.r4_blocked(**ext)
+        self.assertIn("services_stopped=none", self.state_file("blocked"))
+        r = self.run_cmd("apply", self.T2, BAD_TAG=self.T2, **ext)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn("compose stop", self.calls())
+        self.assertIn("services_stopped=none", self.state_file("blocked"))
+        self.assertNotIn("stopped again", r.stderr)
+        self.assertIn("nothing was stopped", r.stderr)
+
+    def test_r5_a2_failed_stop_on_regate_is_loud_and_recorded(self):
+        self.r4_blocked()
+        r = self.run_cmd("apply", self.T2, BAD_TAG=self.T2, MIGRATES_TAG=self.T2, STOP_FAIL="1")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("services_stopped=FAILED", self.state_file("blocked"))
+        self.assertNotIn("services_stopped=backend scheduler", self.state_file("blocked"))
+        self.assertIn("may be serving", r.stderr)
+        self.assertNotIn("stopped again", r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "broken")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "inflight")))
+        st = self.run_cmd("status").stdout
+        self.assertIn("services stopped: FAILED", st)
+        self.assertNotIn("running:", st)
+
+    def test_r5_a3_regate_refusals_happen_before_anything_starts(self):
+        self.r4_blocked()
+        ups = self.calls().count("compose up")
+        for env in ({"CONFIG_FAIL": "1"}, {"PG_DOWN": "1"}):
+            r = self.run_cmd("apply", self.T2, MIGRATES_TAG=self.T2, **env)
+            self.assertEqual(r.returncode, 1, (env, r.stderr))
+            self.assertEqual(self.calls().count("compose up"), ups, env)
+            self.assertFalse(os.path.exists(os.path.join(self.state, "inflight")), env)
+            self.assertIn("services_stopped=backend scheduler", self.state_file("blocked"), env)
+            self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")), env)
+
+    def test_r5_a4_clear_broken_after_a_killed_regate_keeps_blocked(self):
+        self.r4_blocked()
+        with open(os.path.join(self.state, "inflight"), "w") as f:
+            f.write("op=apply\ntag=%s\nstarted=2026-01-01T00:00:00Z\n" % self.T2)   # what a killed re-gate leaves
+        r = self.run_cmd("clear-broken")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "inflight")))
+        self.assertIn("BLOCKED state is still set", r.stderr)
+
+    def test_r5_b1_older_apply_warns_when_latest_cannot_be_read_and_hold_works(self):
+        self.publish(self.T1, latest=False)
+        self.publish(self.T2, latest=False)
+        self.assertEqual(self.run_cmd("apply", self.T2).returncode, 0)
+        r = self.run_cmd("apply", self.T1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("could not read the latest release, so no hold was set", r.stderr)
+        self.assertIn("hs-release hold <tag>", r.stderr)
+        self.assertIn("could not read the latest release", self.state_file("log"))
+        r = self.run_cmd("hold", "not-a-tag")
+        self.assertEqual(r.returncode, 64)
+        r = self.run_cmd("hold", self.T2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(self.T2, self.state_file("refused").split())
+        self.assertIn("held by hand", self.state_file("log"))
+        self.publish(self.T2)   # now latest
+        r = self.run_cmd("apply")
+        self.assertIn("refused/held here", r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+
+    def test_r5_b2_b3_hold_messages_name_every_reason_and_what_lifts_it(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T3)
+        r = self.run_cmd("apply", self.T1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("lifted only by hs-release apply " + self.T3, r.stderr)
+        self.assertIn("deleting its line", r.stderr)
+        self.assertNotIn("until a newer release", r.stderr)
+        for out in (self.run_cmd("apply").stderr, self.run_cmd("check").stdout):
+            self.assertIn("failed the health gate here", out)
+            self.assertIn("was rolled back from", out)
+            self.assertIn("a person applied an older release", out)
+
+    def test_r5_b3_hold_is_not_set_before_the_gate_result(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T3)   # latest
+        r = self.run_cmd("apply", self.T1, BAD_TAG=self.T1)   # the older tag fails: rolled back to T2
+        self.assertEqual(r.returncode, 2, r.stderr)
+        held = self.state_file("refused").split()
+        self.assertIn(self.T1, held)
+        self.assertNotIn(self.T3, held)
+
+    def test_r5_b4_status_while_blocked_says_pinned_not_running(self):
+        self.r4_blocked()
+        out = self.run_cmd("status").stdout
+        self.assertNotIn("running:", out)
+        self.assertIn("pinned in release.env: " + self.T2, out)
+        self.assertIn("services stopped: backend scheduler", out)
+
+    def test_r5_c_invalid_alert_urls(self):
+        bad = ["https://x.test/t   # REQUIRED: your topic", "https://x.test/t#c", "ftp://x.test/t", "x.test/t", "http://", "https://x.test/a b"]
+        for url in bad:
+            st = self.run_cmd("status", HS_RELEASE_ALERT_URL=url).stdout
+            self.assertIn("set but invalid", st, url)
+            self.assertNotIn("is not set", st, url)
+            r = subprocess.run([ALERT, "--test"], env=dict(self.env, HS_RELEASE_ALERT_URL=url), capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(r.returncode, 0, url)
+            self.assertIn("invalid", r.stderr, url)
+            self.assertNotIn("curl-post", self.calls() if os.path.exists(self.log) else "", url)
+        for url in ("http://alert.test/topic", "https://ntfy.example.com/my-topic?auth=1"):
+            self.assertNotIn("invalid", self.run_cmd("status", HS_RELEASE_ALERT_URL=url).stdout, url)
+        # A loud exit warns too.
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        r = self.run_cmd("apply", BAD_TAG=self.T2, MIGRATES_TAG=self.T2, HS_RELEASE_ALERT_URL="https://x.test/t # c")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("set but invalid", r.stderr)
+        # The alert script itself: an invalid URL is not posted to, the journal gets the message and the reason.
+        r = self.run_alert(HS_RELEASE_ALERT_URL="https://x.test/t   # note")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("curl-post", self.calls())
+        self.assertIn("logger -p daemon.err -t hs-release-alert", self.calls())
+        self.assertIn("HS_RELEASE_ALERT_URL is invalid", self.calls())
 
 
 class DeterminityVersionTest(unittest.TestCase):

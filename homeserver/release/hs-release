@@ -12,6 +12,9 @@
 #                                that apply, then switch back
 #   hs-release rollback --db-restored  external database only: REQUIRED there (no schema check is possible): you
 #                                restored the external database yourself; run the previous images
+#   hs-release hold TAG          keep the timer from applying release TAG (lifted by
+#                                `apply TAG`, a rollback onto it, or deleting its line
+#                                from $STATE/refused)
 #   hs-release clear-broken [--force]  after a person has fixed a broken state
 #                                (below): run the health gate on what release.env
 #                                pins and, if it passes, lift the stop
@@ -76,7 +79,8 @@
 #   2 the release failed the health gate and was rolled back (the rollback is
 #     healthy),
 #   3 blocked (above), also what the timer returns while that is unresolved,
-#   4 broken (above): returned when it is written and by every apply after.
+#   4 broken (above): returned when it is written and by every apply after; also
+#     when a re-gate of a blocked release failed and the services could not be stopped.
 # "Running" is always what $TRINITY_DIR/release.env pins; current.env (the
 # last good full state) is brought in line with it whenever it changes.
 set -euo pipefail
@@ -111,10 +115,28 @@ AGENT_TAG=trinity-agent-base:latest   # the local tag the backend creates agents
 RELEASE_RE='^v[0-9]+\.[0-9]+\.[0-9]+-determinity\.[0-9]+$'
 RELEASE_AUTHOR='github-actions[bot]'
 
-# Loud exits only reach a person when an alert URL is set (hs-release-alert);
+# Loud exits only reach a person when a usable alert URL is set (hs-release-alert);
 # otherwise they are a journal line. Say so on every loud exit and in `status`.
+# systemd's EnvironmentFile only treats a line that STARTS with # as a comment, so
+# `HS_RELEASE_ALERT_URL=https://x   # note` reaches the units as one value with the
+# comment inside it: that is invalid here (whitespace or #), not "set".
+alert_url_problem() {  # prints why HS_RELEASE_ALERT_URL is unusable; nothing when unset or fine
+  local u=${HS_RELEASE_ALERT_URL:-}
+  [ -n "$u" ] || return 0
+  case $u in
+    *[[:space:]]*) echo "it contains whitespace (a comment after the value? systemd does not strip it)" ;;
+    *'#'*) echo "it contains # (a comment after the value? systemd does not strip it)" ;;
+    http://?*|https://?*) ;;
+    *) echo "it does not start with http:// or https://" ;;
+  esac
+}
 alert_unset_line() {
-  [ -n "${HS_RELEASE_ALERT_URL:-}" ] || echo "WARNING: HS_RELEASE_ALERT_URL is not set: a failed run only reaches the journal, nobody is told. Set it in /etc/default/hs-release, then run: hs-release-alert --test"
+  local why
+  if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then
+    echo "WARNING: HS_RELEASE_ALERT_URL is not set: a failed run only reaches the journal, nobody is told. Set it in /etc/default/hs-release, then run: hs-release-alert --test"
+  elif why=$(alert_url_problem) && [ -n "$why" ]; then
+    echo "WARNING: HS_RELEASE_ALERT_URL is set but invalid: $why. A failed run only reaches the journal, nobody is told. Fix it in /etc/default/hs-release (the comment goes on its own line), then run: hs-release-alert --test"
+  fi
 }
 loud_exit_warning() {
   local rc=$?
@@ -157,6 +179,9 @@ valid_ref() {  # $1 = service (or agent), $2 = ref
 
 held() { grep -qxF "$1" "$STATE/refused" 2>/dev/null; }
 hold_add() { held "$1" || echo "$1" >> "$STATE/refused"; }
+held_reasons() {
+  echo "it failed the health gate here, it was rolled back from, or a person applied an older release (or ran hs-release hold) so the timer stays; lifted by hs-release apply <that tag> or by deleting its line from $STATE/refused"
+}
 hold_clear() {
   [ -f "$STATE/refused" ] || return 0
   grep -vxF "$1" "$STATE/refused" > "$STATE/refused.new" || true
@@ -508,6 +533,54 @@ restore_previous() {
   if [ -f "$STATE/previous.meta.pre" ]; then mv "$STATE/previous.meta.pre" "$STATE/previous.meta"; else rm -f "$STATE/previous.meta"; fi
 }
 
+# Rewrites services_stopped= in the blocked file so it says what is really stopped.
+set_blocked_stopped() {
+  [ -f "$STATE/blocked" ] || return 0
+  { grep -v '^services_stopped=' "$STATE/blocked" || true; printf 'services_stopped=%s\n' "$1"; } > "$STATE/blocked.new"
+  mv "$STATE/blocked.new" "$STATE/blocked"
+}
+
+# `apply <pinned tag>` while blocked: start the services and run the health gate
+# again. Anything that can refuse (the database check, compose config) runs BEFORE
+# the first change. On the bundled PostgreSQL every non-pass exit stops backend
+# and scheduler again; on any other database nothing is ever stopped (policy).
+# Exits: 0 healthy and unblocked, 3 still blocked, 4 the stop failed (the failed
+# release may be serving on the moved schema), 1 refused before any change.
+regate_blocked() {
+  local tag=$1
+  db_mode
+  if [ "$DB_MODE" = pg ]; then
+    log "$tag is pinned but blocked: starting backend and scheduler and re-running the health gate"
+    set_blocked_stopped "unknown (a re-gate is running: backend and scheduler were started; if this note stays, check docker ps)"
+  else
+    log "$tag is pinned but blocked: re-running the health gate (this database is not the bundled PostgreSQL, so no service is ever stopped)"
+  fi
+  inflight_begin apply "$tag"
+  # shellcheck disable=SC2046
+  if compose up -d --no-build $(echo $SERVICES) && healthy; then
+    sync_current
+    hold_clear "$tag"
+    rm -f "$STATE/blocked" "$STATE/attempt.env"
+    inflight_end
+    log "on $tag (healthy); blocked cleared"
+    return 0
+  fi
+  if [ "$DB_MODE" != pg ]; then
+    set_blocked_stopped none
+    inflight_end
+    log "$tag is still failing the health gate; nothing was stopped (not the bundled PostgreSQL): its services are still running and not verified healthy; staying blocked"
+    return 3
+  fi
+  if compose stop backend scheduler; then
+    set_blocked_stopped "backend scheduler"
+    inflight_end
+    log "$tag is still failing the health gate; backend and scheduler stopped again; staying blocked"
+    return 3
+  fi
+  set_blocked_stopped "FAILED (the stop failed: the failed release may be serving on the moved schema; check docker ps)"
+  broken_exit regate-stop-failed "$tag failed the health gate again and backend and scheduler could NOT be stopped: the failed release may be serving on a moved schema (services_stopped=FAILED in $STATE/blocked)"
+}
+
 cmd_apply() {
   local want=${1:-latest} rel tag tmp s agent_ref agent_before="" rev_before="" backup="" pg=no rev_after
   local stopped_svcs="" hold_latest="" latest_tag="" cur drift published ready rc keep_prev=no old_blocked_backup="" old_blocked_before="" stopped=ok
@@ -538,23 +611,7 @@ cmd_apply() {
   drift=$(drift_message "$rel"); [ -z "$drift" ] || log "WARNING: $drift"
   if [ "$tag" = "$cur" ]; then
     if [ -f "$STATE/blocked" ] && [ "$want" != latest ]; then
-      # Pinned and blocked: the failed release is what release.env names and
-      # backend and scheduler are stopped. Not "already on": run the gate again.
-      log "$tag is pinned but blocked (backend and scheduler stopped): starting the services and re-running the health gate"
-      inflight_begin apply "$tag"
-      # shellcheck disable=SC2046
-      if compose up -d --no-build $(echo $SERVICES) && healthy; then
-        sync_current
-        hold_clear "$tag"
-        rm -f "$STATE/blocked" "$STATE/attempt.env"
-        inflight_end
-        log "on $tag (healthy); blocked cleared"
-        return 0
-      fi
-      log "$tag is still failing the health gate; stopping backend and scheduler again, staying blocked"
-      compose stop backend scheduler || log "WARNING: could not stop the backend and scheduler"
-      inflight_end
-      return 3
+      regate_blocked "$tag"; return $?
     fi
     log "already on $tag"; return 0
   fi
@@ -563,7 +620,7 @@ cmd_apply() {
     # A release that failed the gate here, or that a person rolled back from, is
     # not picked up by the timer.
     if held "$tag"; then
-      log "latest is $tag, which is refused/held here (failed the health gate or was rolled back from); staying on $cur"
+      log "latest is $tag, which is refused/held here ($(held_reasons)); staying on $cur"
       return 0
     fi
     # Forward only: a withdrawn or re-pointed latest must not downgrade the box.
@@ -589,6 +646,8 @@ cmd_apply() {
     if [ -n "$latest_tag" ] && [ "$latest_tag" != "$tag" ]; then
       rc=0; ver_lt "$tag" "$latest_tag" || rc=$?
       [ "$rc" != 0 ] || hold_latest=$latest_tag
+    elif [ -z "$latest_tag" ]; then
+      log "WARNING: could not read the latest release, so no hold was set: the timer may move this box forward again past $tag. To keep it here, name the release to hold: hs-release hold <tag>"
     fi
   fi
   touch "$TRINITY_DIR/release.env"
@@ -641,7 +700,7 @@ cmd_apply() {
     log "on $tag (healthy)"
     if [ -n "$hold_latest" ]; then
       hold_add "$hold_latest"
-      log "$tag is older than the latest release $hold_latest: $hold_latest is held so the timer stays on $tag. To follow it again: hs-release apply $hold_latest (or remove the line from $STATE/refused)"
+      log "$tag is older than the latest release $hold_latest: $hold_latest is held so the timer stays on $tag. The hold on $hold_latest is lifted only by hs-release apply $hold_latest (a person naming it), a rollback that lands on it, or deleting its line from $STATE/refused; a release newer than $hold_latest is not held and the timer follows it once it is old enough"
     fi
     return 0
   fi
@@ -771,6 +830,17 @@ cmd_rollback() {
   if [ -f "$STATE/broken" ]; then log "the broken marker is still set: when everything is as it should be, run hs-release clear-broken"; fi
 }
 
+# Keep the timer from following TAG (it stays in $STATE/refused until a person
+# applies it, a rollback lands on it, or the line is deleted).
+cmd_hold() {
+  local t=${1:-}
+  [[ $t =~ $RELEASE_RE ]] || { echo "usage: hs-release hold <tag>   (a Determinity release tag, vX.Y.Z-determinity.N)" >&2; return 64; }
+  mkdir -p "$STATE"
+  lock
+  hold_add "$t"
+  log "$t is held by hand: the timer will not apply it. Lifted by: hs-release apply $t, a rollback that lands on it, or deleting its line from $STATE/refused"
+}
+
 # A person has fixed it: verify the pinned stack, then lift the stop.
 cmd_clear_broken() {
   local force=no
@@ -791,6 +861,10 @@ cmd_clear_broken() {
   sync_current
   rm -f "$STATE/broken" "$STATE/inflight"
   log "broken marker cleared by hand ($([ "$force" = yes ] && echo 'forced' || echo 'health gate passed')); running: $(current_tag || true)"
+  if [ -f "$STATE/blocked" ]; then
+    log "the BLOCKED state is still set (failed release $(meta_get "$STATE/blocked" tag); services stopped: $(meta_get "$STATE/blocked" services_stopped)): clear-broken does not lift it. Run: hs-release apply $(meta_get "$STATE/blocked" tag) (re-runs the gate), hs-release rollback --restore-db, or hs-release apply <healthy tag>"
+    return 3
+  fi
 }
 
 cmd_check() {
@@ -798,7 +872,7 @@ cmd_check() {
   if [ -f "$STATE/broken" ]; then broken_line; return 4; fi
   latest=$(fetch_release latest | jq -r .tag)
   if [ "$latest" = "$(current_tag)" ]; then echo "up to date: $latest"; return 0; fi
-  if held "$latest"; then echo "latest $latest is refused/held here (failed the health gate or was rolled back from); running: $(current_tag || true)"; return 0; fi
+  if held "$latest"; then echo "latest $latest is refused/held here ($(held_reasons)); running: $(current_tag || true)"; return 0; fi
   echo "newer release: $latest (running: $(current_tag || true))"; return 10
 }
 
@@ -811,6 +885,7 @@ cmd_status() {
     echo "  fix: hs-release rollback --restore-db (or --db-restored on an external database), or hs-release apply <tag> once a healthy release is out; hs-release apply $(meta_get "$STATE/blocked" tag) re-runs the gate on the pinned release"
   fi
   if [ -f "$STATE/broken" ]; then echo "pinned in release.env: $(current_tag || true) (not verified healthy)"
+  elif [ -f "$STATE/blocked" ]; then echo "pinned in release.env: $(current_tag || true) (failed the health gate, NOT a running release; services stopped: $(meta_get "$STATE/blocked" services_stopped))"
   else echo "running: $(current_tag || true)"; fi
   if rel=$(fetch_release latest 2>/dev/null) && latest=$(jq -er .tag <<<"$rel"); then
     echo "latest:  $latest"
@@ -830,8 +905,9 @@ if [ -z "${HS_RELEASE_SOURCED:-}" ]; then
     apply) shift; cmd_apply "$@" ;;
     rollback) shift; cmd_rollback "$@" ;;
     clear-broken) shift; cmd_clear_broken "$@" ;;
+    hold) shift; cmd_hold "$@" ;;
     check) cmd_check ;;
     status) cmd_status ;;
-    *) echo "usage: hs-release status|check|apply [TAG]|rollback [--restore-db|--db-restored]|clear-broken [--force]" >&2; exit 64 ;;
+    *) echo "usage: hs-release status|check|apply [TAG]|rollback [--restore-db|--db-restored]|clear-broken [--force]|hold <tag>" >&2; exit 64 ;;
   esac
 fi

@@ -27,7 +27,11 @@ name: Determinity release
 # days): a fresh run stops in `plan` with "HEAD is already released". The
 # release job resumes only its own work: a tag on this revision, and a Release
 # for that tag whose release.json names this revision. Anything else under
-# that tag stops it.
+# that tag stops it. The image jobs stop too when the tag is already on another
+# revision, so a late re-run of an older run cannot push its images over a
+# released version's image tags. A person with write access clicks the re-run;
+# after 30 days GitHub no longer offers it: leave the tag and the draft as they
+# are and release from a new commit on `hq`, which takes the next number.
 
 on:
   workflow_dispatch:
@@ -244,6 +248,28 @@ jobs:
           submodules: false
           persist-credentials: false
 
+      # A re-run of an older run ("Re-run failed jobs") would otherwise push
+      # this revision's images over the version tags of a release that a later
+      # run already cut under the same number. The tag is created only by the
+      # release job, so a tag on another revision means the number is taken.
+      - name: Version not taken by another revision
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          P_TAG: ${{ needs.plan.outputs.tag }}
+          P_REVISION: ${{ needs.plan.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if sha=$(gh api "repos/${REPO}/git/ref/tags/${P_TAG}" --jq .object.sha 2>tag.err); then
+            [ "$sha" = "$P_REVISION" ] \
+              || { echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"; exit 1; }
+          elif grep -q '(HTTP 404)' tag.err; then
+            echo "tag ${P_TAG} not created yet"
+          else
+            echo "::error::could not read tag ${P_TAG} ($(head -c 300 tag.err))"; exit 1
+          fi
+
       - name: Build provenance
         id: prov
         run: |
@@ -380,6 +406,28 @@ jobs:
           ref: ${{ needs.plan.outputs.revision }}
           submodules: false
           persist-credentials: false
+
+      # A re-run of an older run ("Re-run failed jobs") would otherwise push
+      # this revision's images over the version tags of a release that a later
+      # run already cut under the same number. The tag is created only by the
+      # release job, so a tag on another revision means the number is taken.
+      - name: Version not taken by another revision
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          P_TAG: ${{ needs.plan.outputs.tag }}
+          P_REVISION: ${{ needs.plan.outputs.revision }}
+        run: |
+          set -euo pipefail
+          if sha=$(gh api "repos/${REPO}/git/ref/tags/${P_TAG}" --jq .object.sha 2>tag.err); then
+            [ "$sha" = "$P_REVISION" ] \
+              || { echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"; exit 1; }
+          elif grep -q '(HTTP 404)' tag.err; then
+            echo "tag ${P_TAG} not created yet"
+          else
+            echo "::error::could not read tag ${P_TAG} ($(head -c 300 tag.err))"; exit 1
+          fi
 
       - name: Overlay tests
         run: python3 -I homeserver/agent-image/test_agent_image.py
@@ -590,7 +638,10 @@ jobs:
           while read -r rid; do
             [ -n "$rid" ] || continue
             aid=$(gh api "repos/${REPO}/releases/${rid}" --jq '[.assets[] | select(.name == "release.json") | .id][0] // empty')
-            [ -n "$aid" ] || { echo "::error::Release ${rid} for ${TAG} exists without release.json; the number may have been used. Not touching it"; exit 1; }
+            if [ -z "$aid" ]; then
+              echo "::error::Release ${rid} for ${TAG} is a Release without release.json; not touching it. If it is a draft left by an earlier attempt of THIS release (cancelled during create or upload: the tag ${TAG} is absent or on ${REVISION}), a person deletes that draft Release (not the tag) and re-runs the failed jobs. Otherwise the number may have been used: see RELEASES.md, \"Versions\""
+              exit 1
+            fi
             rev=$(gh api -H 'Accept: application/octet-stream' "repos/${REPO}/releases/assets/${aid}" | jq -r '.revision // empty')
             [ "$rev" = "$REVISION" ] || { echo "::error::Release ${rid} for ${TAG} was cut from ${rev:-an unknown revision}, not ${REVISION}; this version is taken"; exit 1; }
           done < same-name.txt
@@ -635,7 +686,17 @@ jobs:
           # A re-run of an older release (or two releases finishing out of
           # order) must not move `latest` back: fresh installs would get the
           # older one. Publish it, but leave latest where it is.
-          cur=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          # Only a 404 means "no latest yet"; any other failed read stops
+          # here (the draft stays, a re-run finishes it), because reading an
+          # error as "no latest" would move latest back.
+          if cur=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>latest.err); then
+            [ -n "$cur" ] || { echo "::error::releases/latest answered without a tag name"; exit 1; }
+          elif grep -q '(HTTP 404)' latest.err; then
+            cur=
+          else
+            echo "::error::could not read releases/latest ($(head -c 300 latest.err)); not publishing ${TAG} over an unknown latest. Re-run failed jobs once GitHub answers"
+            exit 1
+          fi
           if [ -n "$cur" ] && [ "$cur" != "$TAG" ] \
              && [ "$(printf '%s\n' "$cur" "$TAG" | sort -V | tail -1)" = "$cur" ]; then
             echo "::warning::releases/latest is $cur, newer than $TAG; publishing $TAG without moving latest"
