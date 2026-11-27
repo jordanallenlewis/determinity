@@ -3,7 +3,11 @@
 # Use it on top of upstream's pull-only file, only through the `trinity` wrapper
 # in this folder (or the equivalent command):
 #
-#   docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml <args>
+#   docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml \
+#     --env-file .env --env-file release.env <args>
+#
+# Leave out `--env-file release.env` and every image falls back to `:latest`,
+# which is not what hs-release pinned and tested.
 #
 # Needs Docker Compose 2.24 or newer (for the `!override` tag).
 # The memory numbers are examples for a 16 GB machine. Size them for yours.

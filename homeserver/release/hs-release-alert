@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Runs when hs-release.service fails (OnFailure=): exit 1 = error before any
+# switch, 2 = a release failed the health gate and was rolled back, 3 = the
+# schema moved and a person must restore. Tells a person; changes nothing.
+#
+# HS_RELEASE_ALERT_URL (in /etc/default/hs-release): the message is POSTed to it
+# as text/plain, which ntfy and most webhook receivers accept (Title header set).
+# Unset, or if the POST fails: the message goes to the journal at priority err.
+set -euo pipefail
+
+STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
+host=$(hostname)
+msg="hs-release on $host did not finish cleanly (rolled back, schema moved, or an error). Last log lines:
+$(tail -n 8 "$STATE/log" 2>/dev/null || echo '(no log)')
+Next steps: hs-release status; see RELEASES.md, \"Rolling back\"."
+
+to_journal() { printf '%s\n' "$msg" | logger -p daemon.err -t hs-release-alert; }
+
+if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then to_journal; exit 0; fi
+if ! curl -fsS -m 20 -H "Title: hs-release on $host" -H 'Priority: high' \
+     -H 'Content-Type: text/plain' --data-binary "$msg" "$HS_RELEASE_ALERT_URL" >/dev/null; then
+  to_journal
+  echo "hs-release-alert: could not post to the alert URL; wrote to the journal" >&2
+  exit 1
+fi

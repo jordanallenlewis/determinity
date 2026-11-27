@@ -1,0 +1,8 @@
+[Unit]
+Description=Tell a person that hs-release rolled back or failed
+
+[Service]
+Type=oneshot
+# HS_RELEASE_ALERT_URL is read from here; unset means the journal, at priority err.
+EnvironmentFile=-/etc/default/hs-release
+ExecStart=/usr/local/sbin/hs-release-alert

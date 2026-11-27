@@ -11,7 +11,7 @@
 - puts the OpenTelemetry collector behind an `otel` profile, and binds its ports to loopback;
 - mounts `../patches` and runs `patches/stuck-threshold.py` before the backend starts (`python /patches/stuck-threshold.py || true; exec "$@"`).
 
-`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`, adding `--env-file .env --env-file release.env` when `release.env` exists.
+`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`, adding `--env-file .env --env-file release.env` when `release.env` exists. A compose command run without `release.env` uses the `:latest` images, not the pinned ones: use the wrapper.
 
 Base file: `docker-compose.hosted.yml`. It is the upstream file that uses published images, so nothing is built on the server; the override swaps in Determinity's. If you build images yourself, use `docker-compose.prod.yml` as the base instead. Do not stack the box file on `docker-compose.yml` (the dev file). Every service overridden here (`backend`, `frontend`, `redis`, `scheduler`, `mcp-server`, `vector`, `otel-collector`, `postgres`) exists in `docker-compose.hosted.yml`.
 
@@ -26,7 +26,7 @@ The frontend needs no override: upstream already honours `FRONTEND_BIND_ADDRESS`
 1. Copy the files next to upstream's compose file (Docker Compose 2.24 or newer is needed for `!override`):
    ```
    export TRINITY_DIR=/srv/trinity
-   cp docker-compose.box.yml $TRINITY_DIR/
+   cp docker-compose.box.yml $TRINITY_DIR/     # release.env (pinned images) is written next to it by hs-release
    mkdir -p $TRINITY_DIR/patches && cp ../patches/stuck-threshold.py $TRINITY_DIR/patches/
    install -m 0755 trinity /usr/local/sbin/hs-trinity
    ```
@@ -45,6 +45,7 @@ Do not run upstream's `start.sh`, `install.sh` or a bare `docker compose up` on 
 | `BOX_BACKEND_PORT` | `8000` | host loopback port for the backend |
 | `BOX_MCP_PORT` | `18080` | host loopback port for the MCP server |
 | `BOX_VECTOR_PORT` | `8686` | host loopback port for Vector |
+| `FRONTEND_PORT` | `80` | host port of the frontend (`hs-release` probes it; override `FRONTEND_URL` if it differs) |
 | `BOX_PATCHES_DIR` | `./patches` | host directory mounted at `/patches` |
 
 Memory limits are examples. Edit them in the file for your machine.
