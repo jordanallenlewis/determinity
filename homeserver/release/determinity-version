@@ -15,6 +15,9 @@
 #   git fetch --no-tags https://github.com/abilityai/trinity.git \
 #     '+refs/tags/v*:refs/upstream-tags/v*'
 #
+# Optional input: DETERMINITY_KNOWN_TAGS (see "Next number" below). Output and
+# exit codes do not depend on it being set.
+#
 # Refuses (exit 1) when: no upstream release is in HEAD's history, VERSION does
 # not match that release, or HEAD is already a Determinity release.
 set -euo pipefail
@@ -42,9 +45,15 @@ file_ver=$(tr -d '[:space:]' < VERSION)
 already=$(git tag --points-at HEAD | grep -E "$release_re" | sort -V | tail -1 || true)
 [ -z "$already" ] || die "HEAD is already released as $already; nothing new to release"
 
-# Next number for this upstream base: one more than the highest existing.
+# Next number for this upstream base: one more than the highest ever used. Tags
+# persist when a GitHub Release is deleted, so the highest tag covers deleted
+# releases. Other names that prove a number was used can be passed in
+# DETERMINITY_KNOWN_TAGS (whitespace separated, e.g. the tag names from
+# `gh release list`): they cover a release whose tag was deleted too. A number
+# whose tag AND release are both gone, and that is in no such list, cannot be seen
+# from here and would be reused (RELEASES.md, "Versions").
 esc=${base//./\\.}
-last_n=$(git tag -l "${base}-determinity.*" \
+last_n=$({ git tag -l "${base}-determinity.*"; tr -s ' \t' '\n' <<<"${DETERMINITY_KNOWN_TAGS:-}"; } \
            | sed -n "s/^${esc}-determinity\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)
 n=$(( ${last_n:-0} + 1 ))
 tag="${base}-determinity.${n}"

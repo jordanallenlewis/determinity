@@ -11,7 +11,7 @@
 - puts the OpenTelemetry collector behind an `otel` profile, and binds its ports to loopback;
 - mounts `../patches` and runs `patches/stuck-threshold.py` before the backend starts (`python /patches/stuck-threshold.py || true; exec "$@"`).
 
-`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`, adding `--env-file .env --env-file release.env` when `release.env` exists. A compose command run without `release.env` uses the `:latest` images, not the pinned ones: use the wrapper.
+`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`, adding `--env-file .env --env-file release.env` when `release.env` exists. A compose command run without `release.env` uses the `:latest` images, not the pinned ones (and the wrapper itself falls back to that only before the first `hs-release apply` has written `release.env`): run compose through the wrapper, never bare.
 
 Base file: `docker-compose.hosted.yml`. It is the upstream file that uses published images, so nothing is built on the server; the override swaps in Determinity's. If you build images yourself, use `docker-compose.prod.yml` as the base instead. Do not stack the box file on `docker-compose.yml` (the dev file). Every service overridden here (`backend`, `frontend`, `redis`, `scheduler`, `mcp-server`, `vector`, `otel-collector`, `postgres`) exists in `docker-compose.hosted.yml`.
 
@@ -34,6 +34,10 @@ The frontend needs no override: upstream already honours `FRONTEND_BIND_ADDRESS`
 3. Check the merged file: `hs-trinity config -q`
 4. Start: `hs-trinity up -d` (add `--profile otel` before `up` for the collector).
 5. Point the reverse proxy at `127.0.0.1:8000` (API), `127.0.0.1:18080` (MCP) and the frontend port.
+
+This override, the wrapper and the patches do not update with a release: images follow a release by themselves, these files
+only when you copy them again from the release tag (`../RELEASES.md`, "Running a release on a home server"). `hs-release`
+compares the installed `docker-compose.box.yml` with the hash in `release.json` and warns when it differs.
 
 Do not run upstream's `start.sh`, `install.sh` or a bare `docker compose up` on this host: they use the upstream ports.
 

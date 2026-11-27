@@ -9,6 +9,10 @@
 # Leave out `--env-file release.env` and every image falls back to `:latest`,
 # which is not what hs-release pinned and tested.
 #
+# This file does not follow a release by itself (the images do). It is installed
+# from the release tag by the install step in RELEASES.md; hs-release warns when
+# the installed copy differs from the one in release.json.
+#
 # Needs Docker Compose 2.24 or newer (for the `!override` tag).
 # The memory numbers are examples for a 16 GB machine. Size them for yours.
 # Every service name below exists in upstream docker-compose.hosted.yml.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs when hs-release.service fails (OnFailure=): exit 1 = error before any
 # switch, 2 = a release failed the health gate and was rolled back, 3 = the
-# schema moved and a person must restore. Tells a person; changes nothing.
+# schema moved and a person must restore, 4 = broken (the state is unknown; every
+# later run fails the same way until `hs-release clear-broken`). Tells a person;
+# changes nothing.
 #
 # HS_RELEASE_ALERT_URL (in /etc/default/hs-release): the message is POSTed to it
 # as text/plain, which ntfy and most webhook receivers accept (Title header set).
@@ -10,7 +12,7 @@ set -euo pipefail
 
 STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
 host=$(hostname)
-msg="hs-release on $host did not finish cleanly (rolled back, schema moved, or an error). Last log lines:
+msg="hs-release on $host did not finish cleanly (rolled back, schema moved, broken, or an error). Last log lines:
 $(tail -n 8 "$STATE/log" 2>/dev/null || echo '(no log)')
 Next steps: hs-release status; see RELEASES.md, \"Rolling back\"."
 

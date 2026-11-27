@@ -2,11 +2,15 @@
 
 Run: python3 -m unittest homeserver/release/test_hs_release.py
 """
+import calendar
+import fcntl
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 import textwrap
 import unittest
 
@@ -22,7 +26,7 @@ def digest(tag, svc):
 
 CURL = r"""#!/usr/bin/env bash
 # Stub: serves $FAKE_WEB/<sanitised url>. The probe URLs answer from env knobs:
-# health fails while the release in release.env is $BAD_TAG; frontend/mcp/setup
+# health fails while the release in release.env is one of $BAD_TAG (space separated); frontend/mcp/setup
 # fail when BAD_FRONTEND/BAD_MCP/BAD_SETUP are set. A POST (-d/--data-binary)
 # is an alert: logged, fails when ALERT_FAIL is set.
 url="${@: -1}"
@@ -40,13 +44,15 @@ if [ -n "$post" ]; then
 fi
 rel=$(sed -n 's/^DETERMINITY_RELEASE=//p' "$TRINITY_DIR/release.env" 2>/dev/null)
 if [ "$url" = "$HEALTH_URL" ]; then
-  [ -n "$BAD_TAG" ] && [ "$rel" = "$BAD_TAG" ] && exit 22
+  case " $BAD_TAG " in *" $rel "*) [ -n "$BAD_TAG" ] && exit 22 ;; esac
   exit 0
 fi
-[ "$url" = "$FRONTEND_URL" ] && { [ -n "$BAD_FRONTEND" ] && exit 22; exit 0; }
-[ "$url" = "$MCP_URL" ] && { [ -n "$BAD_MCP" ] && exit 22; exit 0; }
+# BAD_FRONTEND / BAD_MCP / BAD_SETUP: "1" = always, or the release tag(s) it applies to.
+bad() { [ -n "$1" ] && { [ "$1" = 1 ] || case " $1 " in *" $rel "*) true ;; *) false ;; esac; }; }
+[ "$url" = "$FRONTEND_URL" ] && { bad "$BAD_FRONTEND" && exit 22; exit 0; }
+[ "$url" = "$MCP_URL" ] && { bad "$BAD_MCP" && exit 22; exit 0; }
 if [ "$url" = "$SETUP_URL" ]; then
-  [ -n "$BAD_SETUP" ] && { echo '{}'; exit 0; }
+  bad "$BAD_SETUP" && { echo '{}'; exit 0; }
   echo '{"setup_completed": true}'; exit 0
 fi
 f="$FAKE_WEB/$(printf '%s' "$url" | tr '/:?=' '____')"
@@ -66,7 +72,10 @@ img_for() {
   [ -n "$r" ] && echo "$r" || echo "ghcr.io/abilityai/trinity-$1:v1.0.5"
 }
 case "$1" in
-  pull) exit 0 ;;
+  pull)
+    # PULL_FAIL: a substring of the ref whose pull fails.
+    if [ -n "$PULL_FAIL" ]; then case "$*" in *"$PULL_FAIL"*) exit 1 ;; esac; fi
+    exit 0 ;;
   inspect)
     fmt="$3"; id="$4"
     case "$fmt" in
@@ -81,6 +90,13 @@ case "$1" in
       *) echo "id:$(img_for "$id")" ;;
     esac ;;
   image)
+    if [ "$4" = '{{json .RepoDigests}}' ]; then
+      # A decoy digest from another repo comes first; NO_DIGEST: a local-only image.
+      [ -n "$NO_DIGEST" ] && { echo null; exit 0; }
+      name="${5#id:}"; repo="${name%%@*}"; [[ "${repo##*/}" == *:* ]] && repo="${repo%:*}"
+      echo "[\"mirror.test/other/x@sha256:$(printf %064d 1)\",\"$repo@sha256:$(printf %s "$repo" | sha256sum | cut -c1-64)\"]"
+      exit 0
+    fi
     if [ "$5" = trinity-agent-base:latest ]; then echo "id:agent-old"; else echo "id:$5"; fi ;;
   *) exit 0 ;;
 esac
@@ -96,16 +112,28 @@ rev() {
   if [ -n "$MIGRATES_TAG" ] && [ "$rel" = "$MIGRATES_TAG" ]; then echo rev2; else echo rev1; fi
 }
 case "$1" in
-  config) [ -z "$NO_PG" ] && printf 'backend\nfrontend\nscheduler\nmcp-server\npostgres\n' || printf 'backend\nfrontend\n' ;;
-  ps) [ "$3" = postgres ] && [ -n "$NO_PG" ] && exit 0; echo "$3" ;;
+  config)
+    # `config --format json`: the backend's effective DATABASE_URL. NO_PG = empty
+    # (SQLite), DB_URL = whatever is set there, else the bundled default.
+    [ -n "$CONFIG_FAIL" ] && exit 1
+    if [ -n "$NO_PG" ]; then u=""; elif [ -n "$DB_URL" ]; then u="$DB_URL"; else u="postgresql://trinity@postgres:5432/trinity"; fi
+    printf '{"services":{"backend":{"environment":{"DATABASE_URL":"%s"}},"postgres":{}}}\n' "$u" ;;
+  ps) [ "$3" = postgres ] && [ -n "$NO_PG$DB_URL" ] && exit 0; echo "$3" ;;
   up) exit "${UP_FAIL:-0}" ;;
   exec)
     script="$*"
     case "$script" in
       *pg_dump*) [ -n "$DUMP_FAIL" ] && exit 1; [ -n "$DUMP_EMPTY" ] && exit 0; echo "PGDMP rev=$(rev)" ;;
-      *alembic_version*) [ -n "$REV_FAIL" ] && exit 1; rev ;;
+      *alembic_version*)
+        [ -n "$REV_FAIL" ] && exit 1
+        if [ -n "$REV_FAIL_TAG" ] && [ ! -f "$FAKE_DIR/rev_override" ]; then
+          rel=$(sed -n 's/^DETERMINITY_RELEASE=//p' "$TRINITY_DIR/release.env" 2>/dev/null)
+          [ "$rel" = "$REV_FAIL_TAG" ] && exit 1
+        fi
+        [ -n "$REV_ROWS" ] && { echo rev1; echo rev2; exit 0; }
+        rev ;;
       *"DROP SCHEMA"*) echo dropped >> "$FAKE_LOG" ;;
-      *pg_restore*) sed -n 's/^PGDMP rev=//p' > "$FAKE_DIR/rev_override" ;;
+      *pg_restore*) [ -n "$RESTORE_FAIL" ] && exit 1; sed -n 's/^PGDMP rev=//p' > "$FAKE_DIR/rev_override" ;;
     esac ;;
 esac
 exit 0
@@ -152,7 +180,9 @@ class HsReleaseTest(unittest.TestCase):
             FAKE_WEB=self.web,
             FAKE_LOG=self.log,
             **{k: "" for k in ("BAD_TAG", "BAD_FRONTEND", "BAD_MCP", "BAD_SETUP", "CRASH_SVC", "CRASH_TAG",
-                               "MIGRATES_TAG", "NO_PG", "DUMP_FAIL", "DUMP_EMPTY", "REV_FAIL", "ALERT_FAIL")},
+                               "MIGRATES_TAG", "NO_PG", "DUMP_FAIL", "DUMP_EMPTY", "REV_FAIL", "ALERT_FAIL",
+                               "PULL_FAIL", "NO_DIGEST", "RESTORE_FAIL", "DB_URL", "CONFIG_FAIL",
+                               "REV_FAIL_TAG", "REV_ROWS", "HS_RELEASE_EXTERNAL_DB")},
         )
 
     def tearDown(self):
@@ -164,7 +194,8 @@ class HsReleaseTest(unittest.TestCase):
             f.write(body if isinstance(body, str) else json.dumps(body))
 
     def publish(self, tag, latest=True, prerelease=False, draft=False, contract=None,
-                author="github-actions[bot]", agent=False, refs=None, asset=None):
+                author="github-actions[bot]", agent=False, refs=None, asset=None,
+                published_at="2020-01-01T00:00:00Z", homeserver_files=None):
         asset = asset or f"https://github.com/owner/determinity/releases/download/{tag}/release.json"
         images = {s: {"ref": f"ghcr.io/owner/determinity-{s}@{digest(tag, s)}"} for s in SERVICES}
         if agent:
@@ -174,7 +205,9 @@ class HsReleaseTest(unittest.TestCase):
             "schema": "determinity-release/1", "tag": tag, "version": tag[1:],
             "channel": "stable", "images": images,
         }
-        meta = {"tag_name": tag, "draft": draft, "prerelease": prerelease,
+        if homeserver_files is not None and contract is None:
+            rel["homeserver_files"] = homeserver_files
+        meta = {"tag_name": tag, "draft": draft, "prerelease": prerelease, "published_at": published_at,
                 "author": {"login": author},
                 "assets": [{"name": "release.json", "browser_download_url": asset}]}
         self.serve(asset, rel)
@@ -203,7 +236,10 @@ class HsReleaseTest(unittest.TestCase):
         self.assertTrue(env["DETERMINITY_MCP_SERVER_IMAGE"].endswith(digest("v1.0.5-determinity.1", "mcp-server")))
         with open(os.path.join(self.state, "previous.env")) as f:
             prev = f.read()
-        self.assertIn("DETERMINITY_BACKEND_IMAGE=ghcr.io/abilityai/trinity-backend:v1.0.5", prev)
+        # By digest, from the image's own repository (not the decoy from another registry).
+        want = "ghcr.io/abilityai/trinity-backend@sha256:" + hashlib.sha256(b"ghcr.io/abilityai/trinity-backend").hexdigest()
+        self.assertIn("DETERMINITY_BACKEND_IMAGE=" + want, prev)
+        self.assertNotIn("mirror.test", prev)
 
     def test_apply_is_a_no_op_when_current(self):
         self.publish("v1.0.5-determinity.1")
@@ -474,6 +510,151 @@ class HsReleaseTest(unittest.TestCase):
         self.assertIn("code-only", r.stderr)
         self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
 
+    # ---- review round: database mode, restore, rollback point
+
+    def blocked_by_migration(self, **env):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.publish(self.T2)
+        return self.run_cmd("apply", BAD_TAG=self.T2, MIGRATES_TAG=self.T2, **env)
+
+    def test_m6_restore_db_works_when_the_revision_is_unreadable_after_a_failed_gate(self):
+        r = self.blocked_by_migration(REV_FAIL_TAG=self.T2)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("schema_now=unreadable", self.state_file("blocked"))
+        self.assertEqual(self.run_cmd("apply").returncode, 3)
+        r = self.run_cmd("rollback", "--restore-db", MIGRATES_TAG=self.T2, REV_FAIL_TAG=self.T2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restoring anyway", r.stderr)
+        self.assertEqual(self.state_file("../rev_override").strip(), "rev1")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+        self.assertNotEqual(self.run_cmd("apply").returncode, 3)  # the timer is no longer blocked
+
+    def test_m7_sqlite_url_takes_the_sqlite_path_even_with_a_postgres_service(self):
+        self.publish(self.T1)
+        for url in ("sqlite:////data/trinity.db", "sqlite:///x.db"):
+            shutil.rmtree(self.state, ignore_errors=True)
+            r = self.run_cmd("apply", DB_URL=url)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("not PostgreSQL", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.state, "backups")))
+            self.assertNotIn("pg_dump", self.calls())
+            self.run_cmd("rollback", DB_URL=url)
+
+    def test_m7_bundled_postgres_url_takes_the_pg_path(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("database backed up", r.stderr)
+        self.assertNotIn("s3cret", r.stderr)
+
+    def test_m7_external_postgres_is_refused_without_the_opt_in(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", DB_URL="postgresql://u@db.example.test:5432/trinity")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("external database", r.stderr)
+        self.assertIn("HS_RELEASE_EXTERNAL_DB", r.stderr)
+        self.assertNotIn("pw@", r.stderr)
+        self.assertNotIn("compose up", self.calls())
+
+    def test_m7_external_postgres_with_opt_in_blocks_after_a_failed_gate(self):
+        env = dict(DB_URL="postgresql://u@db.example.test:5432/trinity",
+                   HS_RELEASE_EXTERNAL_DB="own-backups-no-rollback-across-migration")
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply", **env).returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "backups")))
+        self.publish(self.T2)
+        r = self.run_cmd("apply", BAD_TAG=self.T2, **env)   # no migration at all: still blocked
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T2)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assertEqual(self.run_cmd("apply", **env).returncode, 3)
+        r = self.run_cmd("rollback", **env)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T2)
+        r = self.run_cmd("rollback", "--restore-db", **env)
+        self.assertEqual(r.returncode, 1)
+        r = self.run_cmd("rollback", "--db-restored", **env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "blocked")))
+
+    def test_m7_unreadable_compose_config_is_not_guessed(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", CONFIG_FAIL="1")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("compose up", self.calls())
+
+    def test_l6_apply_while_blocked_keeps_the_rollback_point_and_dump(self):
+        self.assertEqual(self.blocked_by_migration().returncode, 3)
+        prev, meta = self.state_file("previous.env"), self.state_file("previous.meta")
+        blocked = self.state_file("blocked")
+        dump = [l for l in blocked.split("\n") if l.startswith("backup=")][0][7:]
+        self.publish(self.T3)
+        r = self.run_cmd("apply", self.T3, BAD_TAG=self.T3, MIGRATES_TAG=self.T3)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(self.state_file("previous.env"), prev)
+        self.assertEqual(self.state_file("previous.meta"), meta)
+        self.assertIn("backup=" + dump, self.state_file("blocked"))
+        self.assertTrue(os.path.exists(dump))
+        # The attempt that does not migrate rolls back to what ran, not to the old point.
+        self.publish("v1.0.5-determinity.4")
+        r = self.run_cmd("apply", "v1.0.5-determinity.4", BAD_TAG="v1.0.5-determinity.4", MIGRATES_TAG=self.T2)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertEqual(self.state_file("previous.env"), prev)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "blocked")))
+        r = self.run_cmd("rollback", "--restore-db", MIGRATES_TAG=self.T2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.state_file("../rev_override").strip(), "rev1")
+        self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
+
+    def test_l6_pruning_never_removes_the_dump_blocked_names(self):
+        self.assertEqual(self.blocked_by_migration().returncode, 3)
+        dump = [l for l in self.state_file("blocked").split("\n") if l.startswith("backup=")][0][7:]
+        os.utime(dump, (1, 1))
+        for n, t in (("v1.0.5-determinity.3", 3), ("v1.0.5-determinity.4", 4)):
+            self.publish(n)
+            self.run_cmd("apply", n, BAD_TAG=n, MIGRATES_TAG=self.T2, HS_RELEASE_KEEP_BACKUPS="1")
+        self.assertTrue(os.path.exists(dump))
+
+    def test_l7_services_are_stopped_before_the_post_gate_revision_is_read(self):
+        self.publish(self.T1)
+        self.run_cmd("apply")
+        self.publish(self.T2)
+        self.run_cmd("apply", BAD_TAG=self.T2, MIGRATES_TAG=self.T2)
+        calls = self.calls()
+        i = calls.rindex("compose stop backend scheduler")
+        self.assertGreater(calls.index("alembic_version", i), i)
+        # and the revision read that follows is not the one taken before the switch
+        self.assertGreater(calls.count("alembic_version"), 1)
+
+    def test_l7_a_failed_stop_counts_as_unreadable_and_blocks(self):
+        self.publish(self.T1)
+        self.run_cmd("apply")
+        self.publish(self.T2)
+        shim = os.path.join(self.bin, "fake-compose2")
+        with open(shim, "w") as f:
+            f.write('#!/usr/bin/env bash\n[ "$1" = stop ] && { echo "compose $*" >> "$FAKE_LOG"; exit 1; }\nexec fake-compose "$@"\n')
+        os.chmod(shim, 0o755)
+        r = self.run_cmd("apply", BAD_TAG=self.T2, COMPOSE="fake-compose2")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertIn("schema_now=unreadable", self.state_file("blocked"))
+
+    def test_l8_printed_manual_steps_use_the_install_wrapper_and_stop_on_error(self):
+        r = self.blocked_by_migration()
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("hs-trinity stop backend scheduler mcp-server", r.stderr)
+        self.assertIn("hs-trinity exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1", r.stderr)
+        self.assertNotRegex(r.stderr, r"(?m)^\s+trinity ")
+
+    def test_nit_more_than_one_alembic_row_is_unreadable(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", REV_ROWS="1")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cannot read the Alembic revision", r.stderr)
+        self.assertNotIn("compose up", self.calls())
+
     # ---- M2: the gate
     def test_m2_soak_catches_a_crash_looping_service(self):
         self.publish(self.T1)
@@ -495,7 +676,7 @@ class HsReleaseTest(unittest.TestCase):
         for knob, what in (("BAD_FRONTEND", "frontend"), ("BAD_MCP", "mcp-server"), ("BAD_SETUP", "database read")):
             self.publish(self.T2)
             self.state_clear_held()
-            r = self.run_cmd("apply", self.T2, **{knob: "1"})
+            r = self.run_cmd("apply", self.T2, **{knob: self.T2})   # only the new release is bad
             self.assertEqual(r.returncode, 2, (knob, r.stderr))
             self.assertIn(what, r.stderr)
             self.assertEqual(self.release_env()["DETERMINITY_RELEASE"], self.T1)
@@ -557,6 +738,429 @@ class HsReleaseTest(unittest.TestCase):
         self.publish(self.T1, agent=True, refs={"agent": {"ref": f"docker.io/x/determinity-agent@{digest('a', 'b')}"}})
         self.assert_refused_untouched(self.run_cmd("apply"), "does not match the contract")
 
+    # ---- round 3 helpers
+    def pin(self):
+        return self.release_env()["DETERMINITY_RELEASE"]
+
+    def assert_current_is_pinned(self):
+        """current.env (last good state) must never disagree with release.env."""
+        self.assertEqual(self.current()["DETERMINITY_RELEASE"], self.pin())
+
+    def count(self, needle):
+        return self.calls().count(needle) if os.path.exists(self.log) else 0
+
+    def applied(self, *tags):
+        for t in tags:
+            self.publish(t)
+            r = self.run_cmd("apply")
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    @staticmethod
+    def epoch(iso):
+        return str(calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")))
+
+    # ---- M2: quiet after failure (s2, s6)
+    def test_s2_double_failure_stays_loud_until_a_person_clears_it(self):
+        self.applied(self.T1)
+        self.publish(self.T2)
+        bad = f"{self.T1} {self.T2}"                       # the rollback target is unhealthy too
+        r = self.run_cmd("apply", BAD_TAG=bad)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("BROKEN (double-failure)", r.stderr)
+        marker = self.state_file("broken")
+        self.assertIn("kind=double-failure", marker)
+        self.assertRegex(marker, r"since=\d{4}-\d\d-\d\dT")
+        self.assertIn("reason=", marker)
+        self.assert_current_is_pinned()
+        ups = self.count("compose up")
+        # The next timer runs: still non-zero, still doing nothing, even with a healthy platform.
+        self.publish(self.T3)
+        for _ in range(2):
+            r = self.run_cmd("apply")
+            self.assertEqual(r.returncode, 4, r.stderr)
+            self.assertIn("NOT applying", r.stderr)
+        # A person naming a tag does not get around it either.
+        self.assertEqual(self.run_cmd("apply", self.T3).returncode, 4)
+        self.assertEqual(self.count("compose up"), ups)
+        self.assertEqual(self.pin(), self.T1)
+        self.assertEqual(self.run_cmd("check").returncode, 4)
+        out = self.run_cmd("status").stdout
+        self.assertTrue(out.startswith("BROKEN since"), out)
+        self.assertIn("hs-release clear-broken", out)
+        self.assertNotIn("running:", out)                   # it does not claim a verified state
+        # clear-broken checks the pinned stack first.
+        r = self.run_cmd("clear-broken", BAD_TAG=bad)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.state, "broken")))
+        r = self.run_cmd("clear-broken")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "broken")))
+        self.assertTrue(self.run_cmd("status").stdout.startswith("running:"))
+        r = self.run_cmd("apply")                            # .3 is not held: it goes
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pin(), self.T3)
+        self.assertEqual(self.run_cmd("apply", self.T2).returncode, 0)  # the held failure is still named by hand only
+
+    def test_s2_clear_broken_force_and_nothing_to_clear(self):
+        self.assertIn("nothing to clear", self.run_cmd("clear-broken").stdout)
+        self.applied(self.T1)
+        self.publish(self.T2)
+        bad = f"{self.T1} {self.T2}"
+        self.assertEqual(self.run_cmd("apply", BAD_TAG=bad).returncode, 4)
+        self.assertEqual(self.run_cmd("clear-broken", "--force", BAD_TAG=bad).returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "broken")))
+
+    def test_s6_failed_manual_rollback_is_recorded_and_status_is_truthful(self):
+        self.applied(self.T1, self.T2)
+        r = self.run_cmd("rollback", BAD_TAG=self.T1)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("BROKEN (rollback-failed)", r.stderr)
+        self.assertEqual(self.pin(), self.T1)
+        self.assert_current_is_pinned()                      # was "R2" while release.env pinned R1
+        out = self.run_cmd("status").stdout
+        self.assertTrue(out.startswith("BROKEN since"), out)
+        self.assertIn("pinned in release.env: " + self.T1, out)
+        self.assertNotIn("running: " + self.T2, out)
+        r = self.run_cmd("apply", self.T2)                  # "already on R2" would be the lie
+        self.assertEqual(r.returncode, 4)
+        self.assertNotIn("already on", r.stderr)
+        self.assertEqual(self.run_cmd("apply").returncode, 4)
+
+    def test_m2_failed_restore_is_broken(self):
+        self.applied(self.T1)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply", MIGRATES_TAG=self.T2).returncode, 0)
+        r = self.run_cmd("rollback", "--restore-db", MIGRATES_TAG=self.T2, RESTORE_FAIL="1")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("kind=restore-failed", self.state_file("broken"))
+        self.assertIn("pg_restore failed", self.state_file("broken"))
+        self.assertEqual(self.run_cmd("apply").returncode, 4)
+        self.assertTrue(self.run_cmd("status").stdout.startswith("BROKEN since"))
+
+    def test_m2_a_run_killed_mid_switch_is_found_and_stops_the_timer(self):
+        self.applied(self.T1)
+        with open(os.path.join(self.state, "inflight"), "w") as f:
+            f.write(f"op=apply\ntag={self.T2}\nstarted=2026-01-01T00:00:00Z\n")
+        self.assertIn("INTERRUPTED", self.run_cmd("status").stdout)
+        self.publish(self.T2)
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("kind=interrupted", self.state_file("broken"))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "inflight")))
+
+    def test_m2_blocked_and_broken_are_consistent(self):
+        # blocked (exit 3): the timer waits; a person can fix forward or restore.
+        self.applied(self.T1)
+        self.publish(self.T2)
+        self.assertEqual(self.run_cmd("apply", BAD_TAG=self.T2, MIGRATES_TAG=self.T2).returncode, 3)
+        self.assert_current_is_pinned()
+        self.publish(self.T3)
+        self.assertEqual(self.run_cmd("apply").returncode, 3)
+        self.assertTrue(self.run_cmd("status").stdout.startswith("BLOCKED"))
+        r = self.run_cmd("apply", self.T3)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "blocked")))
+        self.assert_current_is_pinned()
+
+    def test_m2_state_always_matches_the_pin(self):
+        self.applied(self.T1, self.T2)
+        self.assert_current_is_pinned()
+        self.publish(self.T3)
+        self.assertEqual(self.run_cmd("apply", BAD_TAG=self.T3).returncode, 2)
+        self.assert_current_is_pinned()
+        self.assertEqual(self.run_cmd("rollback").returncode, 0)
+        self.assert_current_is_pinned()
+
+    # ---- L2 (s9): after an automatic rollback `previous` is still a rollback target
+    def test_s9_automatic_rollback_keeps_the_previous_rollback_point(self):
+        self.applied(self.T1, self.T2)
+        self.publish(self.T3)
+        self.assertEqual(self.run_cmd("apply", BAD_TAG=self.T3).returncode, 2)
+        self.assertEqual(self.pin(), self.T2)
+        self.assertIn("rollback: " + self.T1, self.run_cmd("status").stdout)   # not "rollback: T2"
+        r = self.run_cmd("rollback")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pin(), self.T1)
+
+    def test_s9_first_switch_failure_leaves_no_bogus_rollback_point(self):
+        self.publish(self.T1)
+        self.assertEqual(self.run_cmd("apply", BAD_TAG=self.T1).returncode, 2)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "previous.env")))
+        self.assertIn("no previous release", self.run_cmd("rollback").stderr)
+
+    # ---- L3: the first rollback point is a digest
+    def test_l3_no_digest_for_the_running_image_refuses_the_first_switch(self):
+        self.publish(self.T1)
+        r = self.run_cmd("apply", NO_DIGEST="1")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("no rollback point by digest", r.stderr)
+        self.assertIn("no repo digest", r.stderr)
+        self.assertNotIn("compose up", self.calls())
+        self.assertFalse(os.path.exists(os.path.join(self.state, "current.env")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "previous.env")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "backups")))   # refused before the dump
+
+    # ---- M5: minimum release age on the timer path
+    def test_m5_young_release_waits_on_the_timer_and_a_person_can_name_it(self):
+        self.publish(self.T1, published_at="2026-11-27T00:00:00Z")
+        r = self.run_cmd("apply", HS_RELEASE_NOW=self.epoch("2026-11-27T10:00:00Z"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("waiting until 2026-11-28T00:00:00Z", r.stderr)
+        self.assertNotIn("docker pull", self.calls() if os.path.exists(self.log) else "")
+        self.assertNotIn("compose up", self.calls() if os.path.exists(self.log) else "")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "current.env")))
+        # One second short of 24 h: still waiting. Exactly 24 h: goes.
+        r = self.run_cmd("apply", HS_RELEASE_NOW=self.epoch("2026-11-27T23:59:59Z"))
+        self.assertIn("waiting until", r.stderr)
+        r = self.run_cmd("apply", HS_RELEASE_NOW=self.epoch("2026-11-28T00:00:00Z"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pin(), self.T1)
+
+    def test_m5_explicit_tag_bypasses_the_age(self):
+        self.publish(self.T1, published_at="2026-11-27T00:00:00Z")
+        r = self.run_cmd("apply", self.T1, HS_RELEASE_NOW=self.epoch("2026-11-27T00:30:00Z"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.pin(), self.T1)
+
+    def test_m5_age_is_configurable_and_zero_turns_it_off(self):
+        self.publish(self.T1, published_at="2026-11-27T00:00:00Z")
+        now = self.epoch("2026-11-27T03:00:00Z")
+        self.assertIn("waiting until 2026-11-27T06:00:00Z",
+                      self.run_cmd("apply", HS_RELEASE_NOW=now, HS_RELEASE_MIN_AGE_HOURS="6").stderr)
+        self.assertEqual(self.run_cmd("apply", HS_RELEASE_NOW=now, HS_RELEASE_MIN_AGE_HOURS="0").returncode, 0)
+        self.assertEqual(self.pin(), self.T1)
+        self.assertEqual(self.run_cmd("apply", HS_RELEASE_MIN_AGE_HOURS="soon").returncode, 1)
+
+    def test_m5_unreadable_published_at_does_not_move_the_box(self):
+        self.publish(self.T1, published_at="")
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("cannot read published_at", r.stderr)
+        self.assertNotIn("compose up", self.calls() if os.path.exists(self.log) else "")
+
+    # ---- L1: the timer only moves forward
+    def test_l1_timer_does_not_downgrade_to_a_withdrawn_latest(self):
+        self.applied(self.T1, self.T2)
+        self.publish(self.T1)                                # latest points back at .1
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("not downgrading", r.stderr)
+        self.assertEqual(self.pin(), self.T2)
+        # A person may go to it by name.
+        self.assertEqual(self.run_cmd("apply", self.T1).returncode, 0)
+        self.assertEqual(self.pin(), self.T1)
+
+    def test_l1_versions_compare_by_field_not_as_text(self):
+        a, b = "v1.0.10-determinity.1", "v1.0.9-determinity.5"
+        self.applied(a)
+        self.publish(b)
+        self.assertIn("not downgrading", self.run_cmd("apply").stderr)
+        self.assertEqual(self.pin(), a)
+        self.applied("v1.0.10-determinity.2", "v1.1.0-determinity.1", "v2.0.0-determinity.1")
+        self.assertEqual(self.pin(), "v2.0.0-determinity.1")
+
+    def test_l1_an_unparseable_running_tag_is_not_moved_from(self):
+        os.makedirs(self.trinity, exist_ok=True)
+        with open(os.path.join(self.trinity, "release.env"), "w") as f:
+            f.write("DETERMINITY_RELEASE=local-build\n")
+        self.publish(self.T1)
+        r = self.run_cmd("apply")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("cannot compare", r.stderr)
+        self.assertEqual(self.pin(), "local-build")
+        self.assertNotIn("compose up", self.calls() if os.path.exists(self.log) else "")
+
+    # ---- M3a: homeserver/ files do not follow a release
+    def sha(self, text):
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def install_files(self, **contents):
+        """Installed copies, mapped through HS_RELEASE_FILES; returns the env knob."""
+        pairs = []
+        for name, text in contents.items():
+            path = os.path.join(self.tmp, "installed-" + name)
+            with open(path, "w") as f:
+                f.write(text)
+            pairs.append(f"homeserver/release/{name}={path}")
+        return " ".join(pairs)
+
+    def test_m3a_drift_warns_in_apply_and_status_without_blocking(self):
+        files = self.install_files(**{"hs-release": "old script\n"})
+        self.publish(self.T1, homeserver_files={
+            "homeserver/release/hs-release": self.sha("new script\n"),
+            "homeserver/release/hs-release-alert": self.sha("x"),   # no installed location mapped: not compared
+        })
+        r = self.run_cmd("apply", HS_RELEASE_FILES=files)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"homeserver files differ from release {self.T1}: homeserver/release/hs-release; "
+                      f"re-run install from tag {self.T1}", r.stderr)
+        self.assertNotIn("hs-release-alert;", r.stderr)
+        self.assertEqual(self.pin(), self.T1)                # a warning, not a block
+        # It repeats on the no-op runs, and status shows it.
+        self.assertIn("homeserver files differ", self.run_cmd("apply", HS_RELEASE_FILES=files).stderr)
+        out = self.run_cmd("status", HS_RELEASE_FILES=files).stdout
+        self.assertIn("WARNING: homeserver files differ from release " + self.T1, out)
+        self.assertEqual(self.run_cmd("status", HS_RELEASE_FILES=files).returncode, 0)
+        self.assertEqual(self.run_cmd("check", HS_RELEASE_FILES=files).returncode, 0)
+
+    def test_m3a_matching_files_and_a_missing_field_are_quiet(self):
+        files = self.install_files(**{"hs-release": "same\n"})
+        self.publish(self.T1, homeserver_files={"homeserver/release/hs-release": self.sha("same\n")})
+        r = self.run_cmd("apply", HS_RELEASE_FILES=files)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("homeserver files differ", r.stderr)
+        self.publish(self.T2)                                  # no homeserver_files at all
+        r = self.run_cmd("apply", HS_RELEASE_FILES=files)
+        self.assertNotIn("homeserver files differ", r.stderr)
+        self.assertNotIn("WARNING", self.run_cmd("status", HS_RELEASE_FILES=files).stdout)
+
+    def test_m3a_default_mapping_covers_the_install_paths_and_a_missing_file_differs(self):
+        with open(os.path.join(self.trinity, "docker-compose.box.yml"), "w") as f:
+            f.write("services: {}\n")
+        self.publish(self.T1, homeserver_files={
+            "homeserver/compose/docker-compose.box.yml": self.sha("services: {}\n"),
+            "homeserver/release/hs-release.timer": self.sha("t"),
+        })
+        r = self.run_cmd("apply")      # the real /etc/systemd/system/hs-release.timer is not there
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("differ from release", r.stderr)
+        self.assertIn("homeserver/release/hs-release.timer", r.stderr)
+        self.assertNotIn("docker-compose.box.yml;", r.stderr)   # matched, so not listed
+        with open(SCRIPT) as f:
+            text = f.read()
+        for repo_path, installed in (("homeserver/release/hs-release", "/usr/local/sbin/hs-release"),
+                                     ("homeserver/release/hs-release-alert", "/usr/local/sbin/hs-release-alert"),
+                                     ("homeserver/release/hs-release.service", "/etc/systemd/system/hs-release.service"),
+                                     ("homeserver/release/hs-release-alert.service", "/etc/systemd/system/hs-release-alert.service"),
+                                     ("homeserver/release/hs-release.timer", "/etc/systemd/system/hs-release.timer"),
+                                     ("homeserver/compose/docker-compose.box.yml", "$TRINITY_DIR/docker-compose.box.yml")):
+            self.assertIn(f"{repo_path}={installed}", text)
+
+    def test_m3a_malformed_entries_are_ignored(self):
+        files = self.install_files(**{"hs-release": "x"})
+        self.publish(self.T1, homeserver_files={"homeserver/release/hs-release": "not-a-sha"})
+        r = self.run_cmd("apply", HS_RELEASE_FILES=files)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("homeserver files differ", r.stderr)
+
+    # ---- M3b: the agent base image follows the release by default
+    def test_m3b_agent_image_opt_out(self):
+        self.applied(self.T1)
+        self.publish(self.T2, agent=True)
+        r = self.run_cmd("apply", HS_RELEASE_AGENT_IMAGE="no")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("determinity-agent", self.calls())
+        self.assertNotIn("trinity-agent-base", self.calls())
+        self.assertNotIn("AGENT_ID=id", self.state_file("previous.meta"))
+
+    def test_m3b_agent_image_follows_by_default_and_is_in_the_rollback_point(self):
+        self.applied(self.T1)
+        self.publish(self.T2, agent=True)
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        self.assertIn("AGENT_ID=id:agent-old", self.state_file("previous.meta"))
+        self.assertNotIn("determinity-agent", self.state_file("previous.env"))  # tags, not env pins
+        # Agent pull failure: nothing switched.
+        self.publish(self.T3, agent=True)
+        ups = self.count("compose up")
+        r = self.run_cmd("apply", PULL_FAIL="determinity-agent")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("pull failed for the agent image", r.stderr)
+        self.assertEqual(self.count("compose up"), ups)
+
+    # ---- L6: tests aimed at mutants that used to survive
+    def sourced(self, script, **extra):
+        env = dict(self.env, HS_RELEASE_SOURCED="1", **extra)
+        return subprocess.run(["bash", "-c", f'. "{SCRIPT}"; {script}'], env=env, capture_output=True, text=True, timeout=30)
+
+    def test_l6a_valid_ref_accepts_only_the_whole_pinned_string(self):
+        d = "a" * 64
+        good = f"ghcr.io/owner/determinity-backend@sha256:{d}"
+        self.assertEqual(self.sourced(f'valid_ref backend "{good}"').returncode, 0)
+        bad = [
+            f"evil.test/{good}",                                   # prefix
+            f"{good}x", f"{good}0",                               # suffix
+            f"docker.io/x/determinity-backend@sha256:{d}",        # other registry
+            f"ghcr.io/other/determinity-backend@sha256:{d}",      # other owner
+            f"ghcr.io/owner/determinity-frontend@sha256:{d}",     # other service
+            "ghcr.io/owner/determinity-backend:latest",           # tag, not digest
+            f"ghcr.io/owner/determinity-backend@sha256:{'a' * 63}",
+            f"ghcr.io/owner/determinity-backend@sha256:{'G' * 64}",
+        ]
+        for ref in bad:
+            self.assertEqual(self.sourced(f'valid_ref backend "{ref}"').returncode, 1, ref)
+        for ref in (good + "\n", good + "\nX=1", "\n" + good, good + "\r"):
+            self.assertEqual(self.sourced('valid_ref backend "$REF"', REF=ref).returncode, 1, repr(ref))
+
+    def test_l6a_release_env_is_not_written_from_a_bad_ref_even_if_the_contract_check_passed(self):
+        d = "b" * 64
+        rel = {"tag": self.T1, "images": {s: {"ref": f"ghcr.io/owner/determinity-{s}@sha256:{d}"} for s in SERVICES}}
+        r = self.sourced(f"env_from_release <<'J'\n{json.dumps(rel)}\nJ")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("DETERMINITY_BACKEND_IMAGE=ghcr.io/owner/determinity-backend@sha256:" + d, r.stdout)
+        rel["images"]["mcp-server"]["ref"] = f"docker.io/x/determinity-mcp-server@sha256:{d}"
+        r = self.sourced(f"env_from_release <<'J'\n{json.dumps(rel)}\nJ")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bad mcp-server image ref", r.stderr)
+        rel["images"]["mcp-server"]["ref"] = f"ghcr.io/owner/determinity-mcp-server@sha256:{d}\nCOMPOSE_PROFILES=otel"
+        self.assertEqual(self.sourced(f"env_from_release <<'J'\n{json.dumps(rel)}\nJ").returncode, 1)
+        rel["images"]["agent"] = {"ref": "ghcr.io/owner/determinity-agent:latest"}
+        r = self.sourced(f"agent_ref_from_release <<'J'\n{json.dumps(rel)}\nJ")
+        self.assertEqual(r.returncode, 1)
+
+    def test_l6b_pull_failure_leaves_the_running_release_untouched(self):
+        self.applied(self.T1)
+        with open(os.path.join(self.trinity, "release.env")) as f:
+            before_env = f.read()
+        before_state = os.listdir(self.state)
+        ups, dumps = self.count("compose up"), len(os.listdir(os.path.join(self.state, "backups")))
+        self.publish(self.T2)
+        for svc in SERVICES:
+            r = self.run_cmd("apply", PULL_FAIL=f"determinity-{svc}@")
+            self.assertEqual(r.returncode, 1, (svc, r.stderr))
+            self.assertIn(f"pull failed for {svc}", r.stderr)
+            with open(os.path.join(self.trinity, "release.env")) as f:
+                self.assertEqual(f.read(), before_env)
+            self.assertEqual(self.count("compose up"), ups)
+            self.assertEqual(self.count("compose stop"), 0)
+            self.assertEqual(len(os.listdir(os.path.join(self.state, "backups"))), dumps)
+        self.assertEqual(self.current()["DETERMINITY_RELEASE"], self.T1)
+        self.assertNotIn("broken", set(os.listdir(self.state)) - set(before_state))
+
+    def test_l6b_every_pull_happens_before_the_backup_and_the_switch(self):
+        self.applied(self.T1)
+        self.publish(self.T2, agent=True)
+        mark = len(self.calls())
+        self.assertEqual(self.run_cmd("apply").returncode, 0)
+        calls = self.calls()[mark:]
+        last_pull = calls.rindex("docker pull")
+        self.assertEqual(calls.count("docker pull"), 5)
+        self.assertLess(last_pull, calls.index("pg_dump"))
+        self.assertLess(last_pull, calls.index("compose up"))
+        self.assertLess(last_pull, calls.index("docker tag"))
+
+    def test_l6c_a_second_apply_while_one_runs_is_refused(self):
+        self.publish(self.T1)
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for args in (("apply",), ("apply", self.T1), ("rollback",), ("clear-broken",)):
+                r = self.run_cmd(*args)
+                self.assertEqual(r.returncode, 1, (args, r.stderr))
+                self.assertIn("another hs-release is running", r.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.trinity, "release.env")))
+            self.assertNotIn("docker", self.calls() if os.path.exists(self.log) else "")
+        self.assertEqual(self.run_cmd("apply").returncode, 0)   # released: works
+
+    # ---- L4: unit files
+    def test_l4_timer_does_not_catch_up_at_boot_and_service_has_a_timeout(self):
+        with open(os.path.join(HERE, "hs-release.timer")) as f:
+            timer = f.read()
+        self.assertIn("Persistent=false", timer)
+        self.assertNotIn("Persistent=true", timer)
+        with open(os.path.join(HERE, "hs-release.service")) as f:
+            unit = f.read()
+        self.assertIn("TimeoutStartSec=45min", unit)
+
     # ---- nits
     def test_status_says_unknown_when_the_api_read_fails(self):
         r = self.run_cmd("status")
@@ -593,6 +1197,74 @@ class HsReleaseTest(unittest.TestCase):
             unit = f.read()
         self.assertIn("OnFailure=hs-release-alert.service", unit)
         self.assertNotIn("SuccessExitStatus", unit)
+
+
+class DeterminityVersionTest(unittest.TestCase):
+    """determinity-version in a throwaway git repo: numbers are never reused."""
+    SCRIPT = os.path.join(HERE, "determinity-version")
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.git("init", "-q", "-b", "hq")
+        self.git("config", "user.email", "t@example.test")
+        self.git("config", "user.name", "t")
+        with open(os.path.join(self.repo, "VERSION"), "w") as f:
+            f.write("1.0.5\n")
+        self.git("add", "VERSION")
+        self.git("commit", "-q", "-m", "upstream 1.0.5")
+        self.git("update-ref", "refs/upstream-tags/v1.0.5", "HEAD")
+        self.commit("local work")
+
+    def tearDown(self):
+        shutil.rmtree(self.repo)
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.repo, *args], check=True, capture_output=True, text=True).stdout
+
+    def commit(self, msg):
+        self.git("commit", "-q", "--allow-empty", "-m", msg)
+
+    def version(self, **env):
+        r = subprocess.run([self.SCRIPT], cwd=self.repo, env=dict(os.environ, **env), capture_output=True, text=True)
+        out = dict(l.split("=", 1) for l in r.stdout.splitlines())
+        return r, out
+
+    def test_first_release_is_number_one_and_the_output_contract_is_unchanged(self):
+        r, out = self.version()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([l.split("=")[0] for l in r.stdout.splitlines()],
+                         ["tag", "version", "upstream_tag", "upstream_commit", "revision", "short_sha", "prev_tag"])
+        self.assertEqual(out["tag"], "v1.0.5-determinity.1")
+        self.assertEqual(out["version"], "1.0.5-determinity.1")
+        self.assertEqual(out["prev_tag"], "v1.0.5")
+
+    def test_the_next_number_follows_the_highest_tag_even_after_a_release_was_deleted(self):
+        # Deleting a GitHub Release leaves its tag: .2 was released and deleted, .1 and .3 are gone from view.
+        for n in (1, 2):
+            self.commit(f"release {n}")
+            self.git("tag", f"v1.0.5-determinity.{n}")
+        self.commit("more")
+        r, out = self.version()
+        self.assertEqual(out["tag"], "v1.0.5-determinity.3", r.stderr)
+        self.assertEqual(out["prev_tag"], "v1.0.5-determinity.2")
+        # A gap in the tags (one was deleted outright) is not filled: the highest wins.
+        self.git("tag", "-d", "v1.0.5-determinity.1")
+        self.assertEqual(self.version()[1]["tag"], "v1.0.5-determinity.3")
+
+    def test_a_number_whose_tag_is_gone_is_not_reused_when_the_release_list_is_given(self):
+        self.commit("release 1")
+        self.git("tag", "v1.0.5-determinity.1")
+        self.commit("release 2 (tag deleted afterwards)")
+        self.commit("more")
+        self.assertEqual(self.version()[1]["tag"], "v1.0.5-determinity.2")   # the limit RELEASES.md states
+        r, out = self.version(DETERMINITY_KNOWN_TAGS="v1.0.5-determinity.2  v1.0.5-determinity.1 v1.0.4-determinity.9 junk")
+        self.assertEqual(out["tag"], "v1.0.5-determinity.3", r.stderr)
+
+    def test_a_released_head_is_refused(self):
+        self.git("tag", "v1.0.5-determinity.1")
+        r, _ = self.version()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("already released", r.stderr)
 
 
 if __name__ == "__main__":

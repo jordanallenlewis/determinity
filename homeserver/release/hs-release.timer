@@ -5,7 +5,10 @@ Description=Check for a new Determinity release once a day
 # Off-peak on purpose: a switch restarts the backend, which interrupts running work.
 OnCalendar=*-*-* 04:15:00 America/Los_Angeles
 RandomizedDelaySec=15m
-Persistent=true
+# Not persistent: a run missed while the host was off must not fire at boot, when
+# Docker and the platform are still coming up and a person may be mid-repair. The
+# next 04:15 picks the release up instead.
+Persistent=false
 
 [Install]
 WantedBy=timers.target

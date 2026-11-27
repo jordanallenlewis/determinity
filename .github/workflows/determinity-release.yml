@@ -73,8 +73,14 @@ jobs:
         id: v
         env:
           DRY: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Release names too (drafts included), so a number is not reused when
+          # a tag was deleted but its Release was not.
+          DETERMINITY_KNOWN_TAGS=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
+          export DETERMINITY_KNOWN_TAGS
           out=$(homeserver/release/determinity-version)
           printf '%s\n' "$out" | tee -a "$GITHUB_OUTPUT"
           if [ "$DRY" = true ]; then echo "image_tag=sha-$(sed -n 's/^short_sha=//p' <<<"$out")"
@@ -193,6 +199,9 @@ jobs:
           npm run build
       - name: Backend and scheduler compile
         run: python3 -m compileall -q src/backend src/scheduler
+      # The release follower ships in this release; its tests gate it.
+      - name: homeserver tests
+        run: bash homeserver/ci/run-homeserver-tests.sh
 
   images:
     name: ${{ matrix.image }}
@@ -261,7 +270,11 @@ jobs:
           {
             echo "build_args<<${delim}"
             if [ "$KIND" = provenance ]; then
-              echo "VERSION=${P_VERSION}"
+              # 1.0.5-determinity.1 -> 1.0.5+determinity.1: the backend reads
+              # the part before `+` as its release version (utils/app_version.py),
+              # so the agent base image check compares 1.0.5 with the image's
+              # label and /api/version still shows the Determinity release.
+              echo "VERSION=${P_VERSION/-determinity./+determinity.}"
               echo "GIT_COMMIT=${P_GIT_COMMIT}"
               echo "GIT_COMMIT_SUBJECT=${P_GIT_COMMIT_SUBJECT}"
               echo "GIT_COMMIT_TIMESTAMP=${P_GIT_COMMIT_TIMESTAMP}"
@@ -297,6 +310,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push (version tags only; latest moves after the Release)
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: ${{ matrix.context }}
@@ -316,9 +330,30 @@ jobs:
             io.github.jordanallenlewis.determinity.upstream.source=https://github.com/abilityai/trinity
             io.github.jordanallenlewis.determinity.upstream.version=${{ needs.plan.outputs.upstream_tag }}
             io.github.jordanallenlewis.determinity.upstream.revision=${{ needs.plan.outputs.upstream_commit }}
-          cache-from: type=gha,scope=determinity-${{ matrix.image }}
-          cache-to: type=gha,scope=determinity-${{ matrix.image }},mode=max
+          # No build cache: the Actions cache is writable by any workflow run on
+          # this repository, so a cached layer could reach a published image.
+          no-cache: true
           build-args: ${{ steps.args.outputs.build_args }}
+
+      # The release pins the digest this job built, never a tag read later: a
+      # re-run of the release job must not pick up an image from another run.
+      - name: Record the digest
+        env:
+          IMAGE: ${{ matrix.image }}
+          REF: ${{ steps.name.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::build gave no digest ('$DIGEST')"; exit 1; }
+          mkdir -p digest
+          echo "$IMAGE $REF $DIGEST" > "digest/${IMAGE}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}
+          path: digest/${{ matrix.image }}
+          if-no-files-found: error
+          retention-days: 30
 
   # The agent base image, hardened (homeserver/agent-image). Built with the
   # local docker engine, not buildx, because harden.sh builds on top of the
@@ -377,6 +412,19 @@ jobs:
             docker tag trinity-agent-base:latest "${ref}:${t}"
             docker push -q "${ref}:${t}"
           done
+          # The digest this job pushed (every tag above is the same image).
+          digest=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "${ref}:sha-${P_SHORT}" \
+                     | sed -n "s|^${ref}@||p" | head -1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no pushed digest for ${ref}"; exit 1; }
+          mkdir -p digest
+          echo "agent $ref $digest" > digest/agent
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-agent
+          path: digest/agent
+          if-no-files-found: error
+          retention-days: 30
 
   release:
     name: release (tag, Release, release.json, latest)
@@ -413,27 +461,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The digests the build jobs of this run pushed. Never read by tag here:
+      # on a re-run a tag can name an image from another run.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digest
+          merge-multiple: true
+
       - name: Image digests and anonymous pull check
         run: |
           set -euo pipefail
           owner="${OWNER,,}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
           : > digests.txt
           for img in backend frontend scheduler mcp-server agent; do
-            # Read the digest the way the server will: anonymously. A server
+            [ -f "digest/${img}" ] || { echo "::error::no digest recorded for ${img} by this run"; exit 1; }
+            read -r k name digest < "digest/${img}"
+            [ "$k" = "$img" ] && [ "$name" = "ghcr.io/${owner}/determinity-${img}" ] \
+              && [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::bad digest record for ${img}: $(cat "digest/${img}")"; exit 1; }
+            # Pull the way the server will: anonymously, by digest. A server
             # pulls without credentials, so a release whose images a stranger
             # cannot pull is refused here (a new GHCR package may start private).
             tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${owner}/determinity-${img}:pull" | jq -r '.token // empty')
-            hdrs=$(curl -sS -I -H "Authorization: Bearer ${tok}" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json' \
-              "https://ghcr.io/v2/${owner}/determinity-${img}/manifests/${IMAGE_TAG}")
-            code=$(printf '%s\n' "$hdrs" | awk 'NR==1 {print $2}')
-            digest=$(printf '%s\n' "$hdrs" | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}')
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -I -H "Authorization: Bearer ${tok}" -H "Accept: ${accept}" \
+              "https://ghcr.io/v2/${owner}/determinity-${img}/manifests/${digest}")
             if [ "$code" != 200 ]; then
-              echo "::error::ghcr.io/${owner}/determinity-${img}:${IMAGE_TAG} is not publicly pullable (HTTP $code). Set the package to public, then re-run."
+              echo "::error::${name}@${digest} is not publicly pullable (HTTP $code). Set the package to public, then re-run the failed jobs."
               exit 1
             fi
-            case "$digest" in sha256:*) ;; *) echo "::error::no digest for determinity-${img}:${IMAGE_TAG}"; exit 1;; esac
-            echo "$img ghcr.io/${owner}/determinity-${img} $digest" | tee -a digests.txt
+            # The version tag must still name the image this run built.
+            tagged=$(curl -sS -I -H "Authorization: Bearer ${tok}" -H "Accept: ${accept}" \
+              "https://ghcr.io/v2/${owner}/determinity-${img}/manifests/${IMAGE_TAG}" \
+              | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}')
+            [ "$tagged" = "$digest" ] \
+              || { echo "::error::${name}:${IMAGE_TAG} is ${tagged:-missing}, this run built ${digest}"; exit 1; }
+            echo "$img $name $digest" | tee -a digests.txt
           done
 
       - name: Fetch upstream release tags (for the notes range)
@@ -444,10 +508,20 @@ jobs:
       - name: release.json and notes
         run: |
           set -euo pipefail
+          # The homeserver/ files a server installs by hand (RELEASES.md
+          # "Install"). They do not follow a release on their own; hs-release
+          # compares its installed copies with these and warns on a mismatch.
+          : > hsfiles.txt
+          for f in homeserver/release/hs-release homeserver/release/hs-release.service \
+                   homeserver/release/hs-release.timer homeserver/release/hs-release-alert \
+                   homeserver/release/hs-release-alert.service homeserver/compose/docker-compose.box.yml; do
+            [ -f "$f" ] || { echo "::error::$f is missing at $REVISION"; exit 1; }
+            echo "$f $(sha256sum "$f" | cut -d' ' -f1)" >> hsfiles.txt
+          done
           jq -n --arg tag "$TAG" --arg version "$VERSION" --arg revision "$REVISION" \
                 --arg utag "$UPSTREAM_TAG" --arg ucommit "$UPSTREAM_COMMIT" \
                 --arg repo "$REPO" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                --rawfile d digests.txt '
+                --rawfile d digests.txt --rawfile h hsfiles.txt '
             {
               schema: "determinity-release/1",
               tag: $tag, version: $version, channel: "stable",
@@ -456,7 +530,9 @@ jobs:
               images: ($d | split("\n") | map(select(length > 0) | split(" "))
                        | map({key: .[0], value: {name: .[1], tag: $version, digest: .[2],
                                                  ref: (.[1] + "@" + .[2])}})
-                       | from_entries)
+                       | from_entries),
+              homeserver_files: ($h | split("\n") | map(select(length > 0) | split(" "))
+                                 | map({key: .[0], value: .[1]}) | from_entries)
             }' > release.json
           cat release.json
           # Range for the notes: the previous Determinity release, or for the
@@ -490,20 +566,48 @@ jobs:
         if: env.DRY != 'true'
         run: |
           set -euo pipefail
-          # Re-runnable: if an earlier attempt created the Release and then
-          # failed, keep it (it must point at this revision) and finish the job.
-          if existing=$(gh release view "$TAG" --repo "$REPO" --json tagName,isDraft,isPrerelease 2>/dev/null); then
-            echo "Release $TAG exists already: $existing"
-            gh release upload "$TAG" release.json --repo "$REPO" --clobber
-            gh release edit "$TAG" --repo "$REPO" --latest
+          # Order: tag (checked) -> draft Release -> release.json (checked) ->
+          # publish as latest. Nothing a server reads exists before every check
+          # has passed. Re-runnable: a tag on this revision and a draft from an
+          # earlier attempt are reused; a published Release is never rewritten.
+          if sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null); then
+            echo "tag $TAG exists at $sha"
           else
-            gh release create "$TAG" release.json \
-              --repo "$REPO" --target "$REVISION" \
-              --title "Determinity ${TAG}" --notes-file notes.md --latest
+            # Lightweight tag by this token: GitHub starts no workflow for it.
+            gh api -X POST "repos/${REPO}/git/refs" -f "ref=refs/tags/${TAG}" -f "sha=${REVISION}" >/dev/null
+            sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)
           fi
-          sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)
           [ "$sha" = "$REVISION" ] || { echo "::error::tag $TAG points at $sha, expected $REVISION"; exit 1; }
-          # releases/latest can lag the create by a few seconds.
+
+          if state=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$state" != true ]; then
+              # Published already: it may be what servers run. Finish only if
+              # it carries exactly this release.json; never replace it.
+              gh release download "$TAG" --repo "$REPO" -p release.json -O published.json
+              if ! cmp -s <(jq -S 'del(.created)' published.json) <(jq -S 'del(.created)' release.json); then
+                echo "::error::Release $TAG is published with a different release.json; not touching it"
+                exit 1
+              fi
+              cp published.json release.json
+            else
+              echo "Release $TAG is a draft from an earlier attempt; refreshing it"
+              gh release upload "$TAG" release.json --repo "$REPO" --clobber
+              gh release edit "$TAG" --repo "$REPO" --notes-file notes.md
+            fi
+          else
+            gh release create "$TAG" release.json --draft --verify-tag \
+              --repo "$REPO" --title "Determinity ${TAG}" --notes-file notes.md
+          fi
+
+          # The asset as a server will read it must be byte-identical to ours.
+          gh release download "$TAG" --repo "$REPO" -p release.json -O check.json --clobber
+          cmp -s check.json release.json || { echo "::error::uploaded release.json differs from the one built"; exit 1; }
+          author=$(gh release view "$TAG" --repo "$REPO" --json author --jq .author.login)
+          [ "$author" = "github-actions" ] || [ "$author" = "github-actions[bot]" ] \
+            || { echo "::error::Release $TAG author is '$author'; servers accept only github-actions[bot]"; exit 1; }
+
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          # releases/latest can lag the publish by a few seconds.
           got=
           for _ in 1 2 3 4 5 6; do
             got=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)

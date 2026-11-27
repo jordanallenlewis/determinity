@@ -14,8 +14,6 @@ on:
   push:
     tags:
       - 'v*'
-      # Determinity releases publish their own images (determinity-release.yml).
-      - '!v*-determinity.*'
   workflow_dispatch:
     inputs:
       ref:
