@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Prints the next Determinity release for HEAD as key=value lines (the
+# $GITHUB_OUTPUT format). Read-only: it creates no tag.
+#
+#   tag=v1.0.5-determinity.1      the git tag and GitHub Release name
+#   version=1.0.5-determinity.1   the image tag (no leading v), like upstream's
+#   upstream_tag=v1.0.5           newest upstream release contained in HEAD
+#   upstream_commit=<sha>         the commit that tag points at
+#   revision=<sha>  short_sha=<7> HEAD
+#   prev_tag=<tag>                last Determinity release in HEAD's history,
+#                                 or upstream_tag if there is none yet
+#
+# Needs this fork's tags (a full clone, or `git fetch --tags origin`) and the
+# upstream release tags under refs/upstream-tags/:
+#   git fetch --no-tags https://github.com/abilityai/trinity.git \
+#     '+refs/tags/v*:refs/upstream-tags/v*'
+#
+# Refuses (exit 1) when: no upstream release is in HEAD's history, VERSION does
+# not match that release, or HEAD is already a Determinity release.
+set -euo pipefail
+
+die() { echo "determinity-version: $*" >&2; exit 1; }
+
+release_re='^v[0-9]+\.[0-9]+\.[0-9]+-determinity\.[0-9]+$'
+
+rev=$(git rev-parse HEAD)
+short=$(git rev-parse --short=7 HEAD)
+
+# Newest upstream stable release (vX.Y.Z, no suffix) that HEAD contains.
+base=""
+while read -r t; do
+  [ -n "$t" ] || continue
+  if git merge-base --is-ancestor "refs/upstream-tags/$t" HEAD; then base=$t; break; fi
+done < <(git for-each-ref --format='%(refname:strip=2)' refs/upstream-tags/ \
+           | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV || true)
+[ -n "$base" ] || die "no upstream release tag (refs/upstream-tags/vX.Y.Z) in HEAD's history"
+base_commit=$(git rev-parse "refs/upstream-tags/$base^{commit}")
+
+file_ver=$(tr -d '[:space:]' < VERSION)
+[ "v$file_ver" = "$base" ] || die "VERSION says '$file_ver' but the newest upstream release in HEAD is $base"
+
+already=$(git tag --points-at HEAD | grep -E "$release_re" | sort -V | tail -1 || true)
+[ -z "$already" ] || die "HEAD is already released as $already; nothing new to release"
+
+# Next number for this upstream base: one more than the highest existing.
+esc=${base//./\\.}
+last_n=$(git tag -l "${base}-determinity.*" \
+           | sed -n "s/^${esc}-determinity\.\([0-9][0-9]*\)$/\1/p" | sort -n | tail -1)
+n=$(( ${last_n:-0} + 1 ))
+tag="${base}-determinity.${n}"
+
+# Previous release in HEAD's history (any base), for the release notes range.
+prev=""
+while read -r t; do
+  [ -n "$t" ] || continue
+  if git merge-base --is-ancestor "$t" HEAD; then prev=$t; break; fi
+done < <(git tag -l 'v*-determinity.*' | grep -E "$release_re" | sort -rV || true)
+
+echo "tag=$tag"
+echo "version=${tag#v}"
+echo "upstream_tag=$base"
+echo "upstream_commit=$base_commit"
+echo "revision=$rev"
+echo "short_sha=$short"
+echo "prev_tag=${prev:-$base}"

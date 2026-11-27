@@ -32,6 +32,12 @@ mounts the start-time patches.
 collides with other services.
 **Enable:** copy it next to the upstream compose file and run Trinity through the `compose/trinity` wrapper.
 
+### Releases and updater: [`release/`](release/), [RELEASES.md](RELEASES.md)
+**What:** `hs-release` switches the server to the latest Determinity release (images pinned by digest), checks that
+it is healthy, and rolls back on its own when it is not. A daily systemd timer runs it.
+**Why:** the server should run what this repository releases, and nothing else, without a person watching each upgrade.
+**Enable:** see [RELEASES.md](RELEASES.md). Problems found on the server are fixed here first: [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### Start-time patch: [`patches/`](patches/)
 **What:** `stuck-threshold.py` makes the business health check use the configured stuck-execution threshold
 instead of a hardcoded 30 minutes.

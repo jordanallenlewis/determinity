@@ -1,0 +1,314 @@
+name: Determinity release
+
+# Cuts a Determinity release from `hq`: tag v<upstream>-determinity.<n>, four
+# runtime images, a GitHub Release marked latest, and release.json (the
+# machine-readable contract, see homeserver/RELEASES.md).
+#
+# Run it from the Actions tab on `hq` (or `gh workflow run determinity-release.yml
+# --ref hq`). The upstream sync starts it after it merges a new upstream release.
+#
+# The tag is created by this workflow's GITHUB_TOKEN, and GitHub starts no other
+# workflow for a ref that token creates. So inherited tag-triggered workflows
+# (publish-images.yml on `v*`) do not run for a Determinity tag. Never push a
+# Determinity tag by hand: that would start them.
+#
+# Order is what keeps a half-finished release invisible: images first (by
+# version tag), then the tag + Release + release.json, then `latest` on the
+# images. A failure before the Release leaves no tag and no Release; re-running
+# picks the same version again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and push the version-tagged images, create no tag or Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: determinity-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan (version)
+    if: github.ref == 'refs/heads/hq'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      upstream_tag: ${{ steps.v.outputs.upstream_tag }}
+      upstream_commit: ${{ steps.v.outputs.upstream_commit }}
+      revision: ${{ steps.v.outputs.revision }}
+      short_sha: ${{ steps.v.outputs.short_sha }}
+      prev_tag: ${{ steps.v.outputs.prev_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: false
+      - name: Fetch upstream release tags
+        run: |
+          git fetch --no-tags https://github.com/abilityai/trinity.git \
+            '+refs/tags/v*:refs/upstream-tags/v*'
+      - name: Next version
+        id: v
+        run: |
+          set -euo pipefail
+          homeserver/release/determinity-version | tee -a "$GITHUB_OUTPUT"
+
+  gate:
+    name: gate (frontend build, backend syntax)
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Frontend build
+        working-directory: src/frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Backend and scheduler compile
+        run: python3 -m compileall -q src/backend src/scheduler
+
+  images:
+    name: ${{ matrix.image }}
+    needs: [plan, gate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: backend
+            context: .
+            dockerfile: docker/backend/Dockerfile
+            build_args: provenance
+          - image: frontend
+            context: ./src/frontend
+            dockerfile: docker/frontend/Dockerfile.prod
+            build_args: none
+          - image: scheduler
+            context: .
+            dockerfile: docker/scheduler/Dockerfile
+            build_args: none
+          - image: mcp-server
+            context: ./src/mcp-server
+            dockerfile: src/mcp-server/Dockerfile
+            build_args: none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          submodules: false
+
+      - name: Build provenance
+        id: prov
+        run: |
+          {
+            echo "git_commit_subject=$(git log -1 --pretty=%s | tr -d '\n\r')"
+            echo "git_commit_timestamp=$(git log -1 --pretty=%cI)"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build args
+        id: args
+        env:
+          KIND: ${{ matrix.build_args }}
+          P_VERSION: ${{ needs.plan.outputs.version }}
+          P_TAG: ${{ needs.plan.outputs.tag }}
+          P_GIT_COMMIT: ${{ needs.plan.outputs.revision }}
+          P_GIT_COMMIT_SUBJECT: ${{ steps.prov.outputs.git_commit_subject }}
+          P_GIT_COMMIT_TIMESTAMP: ${{ steps.prov.outputs.git_commit_timestamp }}
+          P_BUILD_DATE: ${{ steps.prov.outputs.build_date }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<DETERMINITY_EOF'
+            if [ "$KIND" = provenance ]; then
+              echo "VERSION=${P_VERSION}"
+              echo "GIT_COMMIT=${P_GIT_COMMIT}"
+              echo "GIT_COMMIT_SUBJECT=${P_GIT_COMMIT_SUBJECT}"
+              echo "GIT_COMMIT_TIMESTAMP=${P_GIT_COMMIT_TIMESTAMP}"
+              echo "GIT_BRANCH=${P_TAG}"
+              echo "BUILD_DATE=${P_BUILD_DATE}"
+            fi
+            echo 'DETERMINITY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Image name (lowercase owner)
+        id: name
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+        run: echo "ref=ghcr.io/${OWNER,,}/determinity-${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (version tags only; latest moves after the Release)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.name.outputs.ref }}:${{ needs.plan.outputs.version }}
+            ${{ steps.name.outputs.ref }}:${{ needs.plan.outputs.tag }}
+            ${{ steps.name.outputs.ref }}:sha-${{ needs.plan.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=determinity-${{ matrix.image }}
+            org.opencontainers.image.description=Determinity ${{ needs.plan.outputs.tag }}, a fork of Trinity by Ability.ai, based on Trinity ${{ needs.plan.outputs.upstream_tag }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.revision }}
+            org.opencontainers.image.created=${{ steps.prov.outputs.build_date }}
+            org.opencontainers.image.licenses=Apache-2.0
+            io.github.jordanallenlewis.determinity.upstream.source=https://github.com/abilityai/trinity
+            io.github.jordanallenlewis.determinity.upstream.version=${{ needs.plan.outputs.upstream_tag }}
+            io.github.jordanallenlewis.determinity.upstream.revision=${{ needs.plan.outputs.upstream_commit }}
+          cache-from: type=gha,scope=determinity-${{ matrix.image }}
+          cache-to: type=gha,scope=determinity-${{ matrix.image }},mode=max
+          build-args: ${{ steps.args.outputs.build_args }}
+
+  release:
+    name: release (tag, Release, release.json, latest)
+    needs: [plan, images]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+      UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
+      REVISION: ${{ needs.plan.outputs.revision }}
+      PREV_TAG: ${{ needs.plan.outputs.prev_tag }}
+      DRY: ${{ inputs.dry_run }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.revision }}
+          fetch-depth: 0
+          submodules: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image digests and anonymous pull check
+        run: |
+          set -euo pipefail
+          owner="${OWNER,,}"
+          : > digests.txt
+          for img in backend frontend scheduler mcp-server; do
+            # Read the digest the way the server will: anonymously. A server
+            # pulls without credentials, so a release whose images a stranger
+            # cannot pull is refused here (a new GHCR package may start private).
+            tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${owner}/determinity-${img}:pull" | jq -r '.token // empty')
+            hdrs=$(curl -sS -I -H "Authorization: Bearer ${tok}" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/${owner}/determinity-${img}/manifests/${VERSION}")
+            code=$(printf '%s\n' "$hdrs" | awk 'NR==1 {print $2}')
+            digest=$(printf '%s\n' "$hdrs" | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}')
+            if [ "$code" != 200 ]; then
+              echo "::error::ghcr.io/${owner}/determinity-${img}:${VERSION} is not publicly pullable (HTTP $code). Set the package to public, then re-run."
+              exit 1
+            fi
+            case "$digest" in sha256:*) ;; *) echo "::error::no digest for determinity-${img}:${VERSION}"; exit 1;; esac
+            echo "$img ghcr.io/${owner}/determinity-${img} $digest" | tee -a digests.txt
+          done
+
+      - name: Fetch upstream release tags (for the notes range)
+        run: |
+          git fetch --no-tags https://github.com/abilityai/trinity.git \
+            '+refs/tags/v*:refs/upstream-tags/v*'
+
+      - name: release.json and notes
+        run: |
+          set -euo pipefail
+          jq -n --arg tag "$TAG" --arg version "$VERSION" --arg revision "$REVISION" \
+                --arg utag "$UPSTREAM_TAG" --arg ucommit "$UPSTREAM_COMMIT" \
+                --arg repo "$REPO" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --rawfile d digests.txt '
+            {
+              schema: "determinity-release/1",
+              tag: $tag, version: $version, channel: "stable",
+              repo: $repo, revision: $revision, created: $created,
+              upstream: {repo: "abilityai/trinity", tag: $utag, revision: $ucommit},
+              images: ($d | split("\n") | map(select(length > 0) | split(" "))
+                       | map({key: .[0], value: {name: .[1], tag: $version, digest: .[2],
+                                                 ref: (.[1] + "@" + .[2])}})
+                       | from_entries)
+            }' > release.json
+          cat release.json
+          # Range for the notes: the previous Determinity release, or for the
+          # first one the upstream release it is based on.
+          if git rev-parse -q --verify "refs/tags/${PREV_TAG}" >/dev/null \
+             && [ "$PREV_TAG" != "$UPSTREAM_TAG" ]; then base="refs/tags/${PREV_TAG}"
+          else base="refs/upstream-tags/${UPSTREAM_TAG}"; fi
+          {
+            echo "Determinity ${TAG}, based on [Trinity ${UPSTREAM_TAG}](https://github.com/abilityai/trinity/releases/tag/${UPSTREAM_TAG}) by Ability.ai."
+            echo
+            echo "## Changes in Determinity since ${PREV_TAG}"
+            echo
+            # Fork commits only: anything upstream's release contains is left out.
+            git log --no-merges --format='- %s (%h)' "${base}..${REVISION}" "^refs/upstream-tags/${UPSTREAM_TAG}"
+            echo
+            echo "## Images"
+            echo
+            echo "| Image | Tag | Digest |"
+            echo "|---|---|---|"
+            while read -r img name digest; do
+              echo "| \`${name}\` | \`${VERSION}\` | \`${digest}\` |"
+            done < digests.txt
+            echo
+            echo "Install, upgrade and roll back: [homeserver/RELEASES.md](https://github.com/${REPO}/blob/${TAG}/homeserver/RELEASES.md). Machine-readable: \`release.json\`, attached below."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the tag and the Release
+        if: env.DRY != 'true'
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release.json \
+            --repo "$REPO" --target "$REVISION" \
+            --title "Determinity ${TAG}" --notes-file notes.md --latest
+          got=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)
+          [ "$got" = "$TAG" ] || { echo "::error::releases/latest is '$got', expected '$TAG'"; exit 1; }
+          sha=$(gh api "repos/${REPO}/git/ref/tags/${TAG}" --jq .object.sha)
+          [ "$sha" = "$REVISION" ] || { echo "::error::tag $TAG points at $sha, expected $REVISION"; exit 1; }
+
+      - name: Move latest on the images
+        if: env.DRY != 'true'
+        run: |
+          set -euo pipefail
+          while read -r img name digest; do
+            docker buildx imagetools create -t "${name}:latest" "${name}@${digest}"
+          done < digests.txt
+
+      - name: Dry run result
+        if: env.DRY == 'true'
+        run: echo "dry run - images pushed as ${VERSION}; no tag, no Release, latest unchanged"

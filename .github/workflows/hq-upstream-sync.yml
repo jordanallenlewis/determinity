@@ -2,7 +2,8 @@ name: hq upstream sync
 
 # Daily, no LLM. Looks at the latest Abilityai/trinity release. If `hq` does not
 # contain it yet, merges the tag into `hq`, gates on the frontend build, pushes,
-# and starts the image build. Clean merge + green gate = images. Conflict or red
+# and starts the image build and a Determinity release (determinity-release.yml).
+# Clean merge + green gate = images and a release. Conflict or red
 # gate = a pull request on this fork (branch hq-sync/<tag>-<run>) for a human to
 # fix; patches the release already contains are dropped while resolving.
 #
@@ -102,6 +103,8 @@ jobs:
         run: |
           git push origin HEAD:hq
           gh workflow run hq-images.yml --ref hq
+          # A new upstream release on hq is a new Determinity release.
+          gh workflow run determinity-release.yml --ref hq
 
       - name: Dry run result
         if: steps.rel.outputs.needed == 'true' && env.DRY == 'true'

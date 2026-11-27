@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for a new Determinity release once a day
+
+[Timer]
+# Off-peak on purpose: a switch restarts the backend, which interrupts running work.
+OnCalendar=*-*-* 04:15:00 America/Los_Angeles
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

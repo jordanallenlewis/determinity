@@ -62,3 +62,4 @@ Add screenshots to help explain your changes.
 
 - [ ] Does this change the guide? If yes, link the guide PR:
 - [ ] If this adds, changes or removes a difference from upstream Trinity, the README's "What's different" table is updated in this PR.
+- [ ] If this fixes a problem hit on a running server, it links the issue (`Fixes #`), and any fix made only on the server is listed there so it can be removed once a release carries this change ([homeserver/CONTRIBUTING.md](../homeserver/CONTRIBUTING.md)).

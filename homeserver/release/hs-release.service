@@ -1,0 +1,12 @@
+[Unit]
+Description=Follow the latest Determinity release (health gate, automatic rollback)
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# Set TRINITY_DIR and the rest in this file (the variables are listed at the top of the script).
+EnvironmentFile=-/etc/default/hs-release
+ExecStart=/usr/local/sbin/hs-release apply
+# Exit 2 = the new release failed the health gate and was rolled back.
+SuccessExitStatus=0

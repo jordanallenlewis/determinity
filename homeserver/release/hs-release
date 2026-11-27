@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Follow Determinity releases on a home server, with a health gate and
+# automatic rollback. No model, no GitHub token: it reads the public
+# releases API and the release.json attached to each release.
+#
+#   hs-release status            what runs now and what the latest release is
+#   hs-release check             exit 0 if up to date, 10 if a newer release exists
+#   hs-release apply [TAG]       switch to TAG (default: the latest release)
+#   hs-release rollback          switch back to what ran before the last apply
+#
+# Environment (defaults in brackets):
+#   DETERMINITY_REPO   [jordanallenlewis/determinity]
+#   TRINITY_DIR        [/srv/trinity]  holds docker-compose.hosted.yml, .env,
+#                      docker-compose.box.yml; release.env is written here
+#   HS_RELEASE_STATE   [/var/lib/hs-release]  current.env, previous.env, log
+#   HEALTH_URL         [http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/health]
+#   HEALTH_TIMEOUT     [300]  seconds the new release has to answer 200
+#   COMPOSE            [docker compose -p trinity -f docker-compose.hosted.yml
+#                       -f docker-compose.box.yml --env-file .env --env-file release.env]
+#
+# What it pins: the four Determinity images by digest, through release.env
+# (DETERMINITY_{BACKEND,FRONTEND,SCHEDULER,MCP_SERVER}_IMAGE), which
+# docker-compose.box.yml reads. Everything else in the stack is untouched.
+set -euo pipefail
+
+REPO=${DETERMINITY_REPO:-jordanallenlewis/determinity}
+TRINITY_DIR=${TRINITY_DIR:-/srv/trinity}
+STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
+HEALTH_URL=${HEALTH_URL:-http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/health}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-300}
+API=${GITHUB_API:-https://api.github.com}
+SERVICES="backend frontend scheduler mcp-server"
+RELEASE_RE='^v[0-9]+\.[0-9]+\.[0-9]+-determinity\.[0-9]+$'
+
+log() { printf '%s hs-release: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$STATE/log" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+compose() {
+  if [ -n "${COMPOSE:-}" ]; then (cd "$TRINITY_DIR" && $COMPOSE "$@"); return; fi
+  (cd "$TRINITY_DIR" && docker compose -p trinity -f docker-compose.hosted.yml \
+     -f docker-compose.box.yml --env-file .env --env-file release.env "$@")
+}
+
+var_for() {  # backend -> DETERMINITY_BACKEND_IMAGE
+  local s=${1^^}; echo "DETERMINITY_${s//-/_}_IMAGE"
+}
+
+current_tag() { sed -n 's/^DETERMINITY_RELEASE=//p' "$STATE/current.env" 2>/dev/null || true; }
+
+# Release metadata: refuses drafts, pre-releases and tags outside the scheme.
+fetch_release() {  # $1 = tag or "latest"; prints release.json
+  local url meta tag asset
+  if [ "$1" = latest ]; then url="$API/repos/$REPO/releases/latest"
+  else url="$API/repos/$REPO/releases/tags/$1"; fi
+  meta=$(curl -fsS -H 'Accept: application/vnd.github+json' "$url") || die "cannot read $url"
+  tag=$(jq -r .tag_name <<<"$meta")
+  [ "$(jq -r .draft <<<"$meta")" = false ] || die "$tag is a draft"
+  [ "$(jq -r .prerelease <<<"$meta")" = false ] || die "$tag is a pre-release"
+  [[ $tag =~ $RELEASE_RE ]] || die "$tag is not a Determinity release tag"
+  asset=$(jq -r '.assets[] | select(.name == "release.json") | .browser_download_url' <<<"$meta")
+  [ -n "$asset" ] || die "$tag has no release.json"
+  curl -fsSL "$asset" | jq -e --arg t "$tag" '
+      select(.schema == "determinity-release/1" and .tag == $t and .channel == "stable")
+      | select([.images.backend, .images.frontend, .images.scheduler, .images["mcp-server"]]
+               | all(. != null and (.ref | test("@sha256:[0-9a-f]{64}$"))))' \
+    || die "$tag: release.json does not match the contract"
+}
+
+env_from_release() {  # release.json on stdin -> release.env text
+  local rel; rel=$(cat)
+  echo "DETERMINITY_RELEASE=$(jq -r .tag <<<"$rel")"
+  for s in $SERVICES; do
+    echo "$(var_for "$s")=$(jq -r --arg s "$s" '.images[$s].ref' <<<"$rel")"
+  done
+}
+
+# What runs now, as a release.env, so the first switch can roll back to it.
+env_from_running() {
+  echo "DETERMINITY_RELEASE=$(current_tag)"
+  for s in $SERVICES; do
+    local id img
+    id=$(compose ps -q "$s" 2>/dev/null | head -1)
+    [ -n "$id" ] || die "service $s is not running; cannot record a rollback point"
+    img=$(docker inspect --format '{{.Config.Image}}' "$id")
+    echo "$(var_for "$s")=$img"
+  done
+}
+
+healthy() {  # the new containers run the pinned images and the backend answers
+  local deadline
+  for s in $SERVICES; do
+    local want id have
+    want=$(sed -n "s/^$(var_for "$s")=//p" "$TRINITY_DIR/release.env")
+    id=$(compose ps -q "$s" | head -1)
+    [ -n "$id" ] || { log "health: $s has no container"; return 1; }
+    have=$(docker inspect --format '{{.Image}}' "$id")
+    [ "$have" = "$(docker image inspect --format '{{.Id}}' "$want")" ] \
+      || { log "health: $s runs $have, not $want"; return 1; }
+  done
+  deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+  while :; do
+    if curl -fsS -m 10 -o /dev/null "$HEALTH_URL"; then return 0; fi
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep 5
+  done
+  log "health: $HEALTH_URL did not answer 200 within ${HEALTH_TIMEOUT}s"
+  return 1
+}
+
+switch_to() {  # $1 = file with release.env content
+  cp "$1" "$TRINITY_DIR/release.env.new"
+  mv "$TRINITY_DIR/release.env.new" "$TRINITY_DIR/release.env"
+  # shellcheck disable=SC2046
+  compose up -d --no-build $(echo $SERVICES)
+}
+
+cmd_apply() {
+  local want=${1:-latest} rel tag tmp
+  mkdir -p "$STATE"
+  exec 9>"$STATE/lock"; flock -n 9 || die "another hs-release is running"
+  rel=$(fetch_release "$want")
+  tag=$(jq -r .tag <<<"$rel")
+  if [ "$tag" = "$(current_tag)" ]; then log "already on $tag"; return 0; fi
+  # A release that failed the gate here is not retried by the timer; a person
+  # names it (`hs-release apply TAG`) to try it again.
+  if [ "$want" = latest ] && grep -qxF "$tag" "$STATE/refused" 2>/dev/null; then
+    log "latest is $tag, which failed the health gate here before; staying on $(current_tag)"
+    return 0
+  fi
+  touch "$TRINITY_DIR/release.env"
+  tmp=$(mktemp "$STATE/next.XXXXXX")
+  env_from_release <<<"$rel" > "$tmp"
+  for s in $SERVICES; do
+    docker pull -q "$(sed -n "s/^$(var_for "$s")=//p" "$tmp")" >/dev/null || die "pull failed for $s ($tag)"
+  done
+  # Rollback point: the last good state, or what runs now on the first switch.
+  if [ -f "$STATE/current.env" ]; then cp "$STATE/current.env" "$STATE/previous.env"
+  else env_from_running > "$STATE/previous.env"; fi
+  log "switching $(current_tag || true) -> $tag"
+  if switch_to "$tmp" && healthy; then
+    mv "$tmp" "$STATE/current.env"
+    if [ -f "$STATE/refused" ]; then grep -vxF "$tag" "$STATE/refused" > "$STATE/refused.new" || true; mv "$STATE/refused.new" "$STATE/refused"; fi
+    log "on $tag (healthy)"
+    return 0
+  fi
+  log "$tag failed the health gate; rolling back"
+  echo "$tag" >> "$STATE/refused"
+  rm -f "$tmp"
+  switch_to "$STATE/previous.env" || true
+  if healthy; then log "rolled back to $(sed -n 's/^DETERMINITY_RELEASE=//p' "$STATE/previous.env")"; cp "$STATE/previous.env" "$STATE/current.env"
+  else log "ROLLBACK ALSO UNHEALTHY: a person must look"; fi
+  exit 2
+}
+
+cmd_rollback() {
+  mkdir -p "$STATE"
+  exec 9>"$STATE/lock"; flock -n 9 || die "another hs-release is running"
+  [ -f "$STATE/previous.env" ] || die "no previous release recorded"
+  switch_to "$STATE/previous.env"
+  healthy || die "rollback target is unhealthy: a person must look"
+  cp "$STATE/current.env" "$STATE/next-rollback.env" 2>/dev/null || true
+  cp "$STATE/previous.env" "$STATE/current.env"
+  [ -f "$STATE/next-rollback.env" ] && mv "$STATE/next-rollback.env" "$STATE/previous.env"
+  log "rolled back to $(current_tag)"
+}
+
+cmd_check() {
+  local latest; latest=$(fetch_release latest | jq -r .tag)
+  if [ "$latest" = "$(current_tag)" ]; then echo "up to date: $latest"; return 0; fi
+  echo "newer release: $latest (running: $(current_tag || true))"; return 10
+}
+
+cmd_status() {
+  echo "running: $(current_tag || true)"
+  echo "latest:  $(fetch_release latest | jq -r .tag)"
+  [ -f "$STATE/previous.env" ] && echo "rollback: $(sed -n 's/^DETERMINITY_RELEASE=//p' "$STATE/previous.env")"
+  return 0
+}
+
+mkdir -p "$STATE"
+case "${1:-}" in
+  apply) shift; cmd_apply "$@" ;;
+  rollback) cmd_rollback ;;
+  check) cmd_check ;;
+  status) cmd_status ;;
+  *) echo "usage: hs-release status|check|apply [TAG]|rollback" >&2; exit 64 ;;
+esac

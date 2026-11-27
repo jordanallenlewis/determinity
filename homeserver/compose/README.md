@@ -4,15 +4,16 @@
 
 `docker-compose.box.yml` is an override file for Trinity's pull-only compose file. It:
 
+- runs Determinity's images for the backend, frontend, scheduler and MCP server, each set by a variable (`DETERMINITY_BACKEND_IMAGE` and so on) that `../release/hs-release` pins by digest in `release.env` (see `../RELEASES.md`); without `release.env` they follow `latest`;
 - binds the backend, MCP server and Vector ports to `127.0.0.1` only (`!override`);
 - sets example memory limits (backend 4g, postgres 2g, the rest 256-512m) and `cpu_shares` so the platform wins CPU contention against agent workloads;
 - makes the backend and scheduler wait for a healthy postgres (`depends_on` with `service_healthy`);
 - puts the OpenTelemetry collector behind an `otel` profile, and binds its ports to loopback;
 - mounts `../patches` and runs `patches/stuck-threshold.py` before the backend starts (`python /patches/stuck-threshold.py || true; exec "$@"`).
 
-`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`.
+`trinity` is a small wrapper that runs `docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"` from `$TRINITY_DIR`, adding `--env-file .env --env-file release.env` when `release.env` exists.
 
-Base file: `docker-compose.hosted.yml`. It is the upstream file that uses published images (`ghcr.io/abilityai/trinity-*`), so nothing is built on the server. If you build images yourself, use `docker-compose.prod.yml` as the base instead. Do not stack the box file on `docker-compose.yml` (the dev file). Every service overridden here (`backend`, `frontend`, `redis`, `scheduler`, `mcp-server`, `vector`, `otel-collector`, `postgres`) exists in `docker-compose.hosted.yml`.
+Base file: `docker-compose.hosted.yml`. It is the upstream file that uses published images, so nothing is built on the server; the override swaps in Determinity's. If you build images yourself, use `docker-compose.prod.yml` as the base instead. Do not stack the box file on `docker-compose.yml` (the dev file). Every service overridden here (`backend`, `frontend`, `redis`, `scheduler`, `mcp-server`, `vector`, `otel-collector`, `postgres`) exists in `docker-compose.hosted.yml`.
 
 ## Why
 

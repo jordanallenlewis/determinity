@@ -8,9 +8,15 @@
 # Needs Docker Compose 2.24 or newer (for the `!override` tag).
 # The memory numbers are examples for a 16 GB machine. Size them for yours.
 # Every service name below exists in upstream docker-compose.hosted.yml.
+#
+# Images: the four Trinity-built services run Determinity's images. Each one is
+# pinned by digest through release.env, which homeserver/release/hs-release
+# writes (see homeserver/RELEASES.md). Without release.env they follow the
+# moving `latest` tag of the newest Determinity release.
 
 services:
   backend:
+    image: ${DETERMINITY_BACKEND_IMAGE:-ghcr.io/jordanallenlewis/determinity-backend:latest}
     # Loopback only: a reverse proxy on the same host is the one way in.
     # Upstream publishes 0.0.0.0:8000.
     ports: !override
@@ -30,6 +36,7 @@ services:
         condition: service_healthy
 
   frontend:
+    image: ${DETERMINITY_FRONTEND_IMAGE:-ghcr.io/jordanallenlewis/determinity-frontend:latest}
     mem_limit: 256m        # example
     # Its published ports are controlled by FRONTEND_BIND_ADDRESS in .env
     # (set it to 127.0.0.1); see README.
@@ -38,12 +45,14 @@ services:
     mem_limit: 512m        # example
 
   scheduler:
+    image: ${DETERMINITY_SCHEDULER_IMAGE:-ghcr.io/jordanallenlewis/determinity-scheduler:latest}
     mem_limit: 512m        # example
     depends_on:
       postgres:
         condition: service_healthy
 
   mcp-server:
+    image: ${DETERMINITY_MCP_SERVER_IMAGE:-ghcr.io/jordanallenlewis/determinity-mcp-server:latest}
     ports: !override
       - "127.0.0.1:${BOX_MCP_PORT:-18080}:8080"   # 8080 is commonly taken on a home server
     mem_limit: 512m        # example
