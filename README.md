@@ -2,8 +2,8 @@
 <!-- slot:hero -->
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="homeserver/assets/determinity-hero-dark.webp">
-    <img src="homeserver/assets/determinity-hero-light.webp" alt="Determinity: the deterministic layer for Trinity, a fork of Trinity by Ability.ai" width="100%" />
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/determinity-hero-dark.webp">
+    <img src="docs/assets/determinity-hero-light.webp" alt="Determinity: the deterministic layer for Trinity, a fork of Trinity by Ability.ai" width="100%" />
   </picture>
 </p>
 <p align="center"><strong>A hardened home-server layer for Trinity.</strong> A fork of <a href="https://github.com/abilityai/trinity">Trinity</a> by Ability.ai.</p>
@@ -42,7 +42,7 @@ The name is deterministic + Trinity.
 
 ## What's different
 
-<!-- slot:diagram (until the diagram lands: nothing; then a light/dark <picture> from homeserver/assets/) -->
+<!-- slot:diagram (until the diagram lands: nothing; then a light/dark <picture> from docs/assets/) -->
 <!-- /slot:diagram -->
 
 <!-- determinity:differences:start (one row per difference from upstream; checked against the setup guide) -->
