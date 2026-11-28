@@ -34,7 +34,10 @@ After 30 days GitHub no longer offers the re-run. Leave the tag and the draft Re
 used; servers never read a draft) and release again from a new commit on `hq`: the next run takes the next number.
 A draft without `release.json` that an earlier attempt of the same release left behind (cancelled while creating or
 uploading; its tag is on that run's revision) stops every re-run; a person deletes that draft Release, not the tag, and re-runs the failed jobs.
-A new Trinity release that the daily sync merges into `hq` starts a new release on its own. A Determinity-only change
+A new Trinity release that the daily sync merges into `hq` starts a new release on its own. When the sync opens a
+pull request instead, GitHub does not start the `hq` checks on it by itself (it is opened with the workflow token):
+before merging it, a person starts them, for example by closing and reopening the pull request or pushing a commit
+to its branch, and waits for them to pass. A Determinity-only change
 is released by running the **Determinity release** workflow on `hq` from the Actions tab.
 
 Every release has:
@@ -51,6 +54,8 @@ Every release has:
 The agent base image is normally not rebuilt: Determinity does not change `docker/base-image/`, so agents keep using
 upstream's `trinity-agent-base` for the same Trinity version. A release that does change it carries a fifth,
 optional image, `ghcr.io/jordanallenlewis/determinity-agent`, listed as `images.agent` in `release.json`.
+No release carries it yet: the hardened agent image is planned for `v1.0.5-determinity.2`
+([known issue](agent-image/README.md#known-issue)).
 
 ## The contract a machine can follow
 
@@ -95,7 +100,11 @@ optional image, `ghcr.io/jordanallenlewis/determinity-agent`, listed as `images.
 
 What follows a release by itself, and what does not:
 
-- **Follows automatically:** the four images (and `images.agent`), pinned by digest by `hs-release`.
+- **Follows automatically:** the four images (and `images.agent`, once a release carries it), pinned by digest by
+  `hs-release`.
+- **Does not follow yet:** the agent base image, `trinity-agent-base`. Agents keep the one the server has. If it is
+  older than the Trinity release the server runs, the backend raises `fleet_base_image_stale` and agents stay on the
+  old runtime: rebuild it from the release tag with `./scripts/deploy/build-base-image.sh`, then recreate the agents.
 - **Does not follow:** the files under `homeserver/` that live on the server itself: `hs-release` and `hs-release-alert`,
   their systemd units, the compose override (`docker-compose.box.yml`), the `trinity` wrapper and the patches. They reach
   the server through the install step below, run from the release tag, and the release notes say when they changed.

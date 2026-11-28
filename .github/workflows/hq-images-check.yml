@@ -1,0 +1,123 @@
+name: hq images check
+
+# Builds the four runtime images on pull requests into `hq`, without pushing
+# them, so most broken image builds show on the pull request and not first in
+# a release dry run. Same images, contexts, Dockerfiles and build arguments as
+# hq-images.yml, which publishes them after a merge. It reads hq-images.yml's
+# build cache and the release builds without it, so a step that fails only
+# without the cache can still pass here.
+#
+# GitHub does not start it by itself on the pull requests the upstream sync
+# opens with the workflow token. Before merging such a pull request, a person
+# starts it, for example by closing and reopening the pull request or pushing a
+# commit to its branch, and waits for it to pass. The hardened agent image is
+# not built here because it is not in releases yet
+# (homeserver/agent-image/README.md).
+
+on:
+  pull_request:
+    branches: [hq]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hq-images-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (frontend build, backend syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Frontend build
+        working-directory: src/frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Backend and scheduler compile
+        run: python3 -m compileall -q src/backend src/scheduler
+
+  build:
+    name: ${{ matrix.image }}
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: trinity-backend
+            context: .
+            dockerfile: docker/backend/Dockerfile
+            build_args: provenance
+          - image: trinity-frontend
+            context: ./src/frontend
+            dockerfile: docker/frontend/Dockerfile.prod
+            build_args: none
+          - image: trinity-scheduler
+            context: .
+            dockerfile: docker/scheduler/Dockerfile
+            build_args: none
+          - image: trinity-mcp-server
+            context: ./src/mcp-server
+            dockerfile: src/mcp-server/Dockerfile
+            build_args: none
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Collect build provenance
+        id: prov
+        run: |
+          {
+            echo "version=$(tr -d '[:space:]' < VERSION)"
+            echo "git_commit=$(git rev-parse HEAD)"
+            echo "git_commit_subject=$(git log -1 --pretty=%s | tr -d '\n\r')"
+            echo "git_commit_timestamp=$(git log -1 --pretty=%cI)"
+            echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Select build args
+        id: args
+        env:
+          KIND: ${{ matrix.build_args }}
+          P_VERSION: ${{ steps.prov.outputs.version }}
+          P_GIT_COMMIT: ${{ steps.prov.outputs.git_commit }}
+          P_GIT_COMMIT_SUBJECT: ${{ steps.prov.outputs.git_commit_subject }}
+          P_GIT_COMMIT_TIMESTAMP: ${{ steps.prov.outputs.git_commit_timestamp }}
+          P_BUILD_DATE: ${{ steps.prov.outputs.build_date }}
+        run: |
+          set -euo pipefail
+          {
+            echo 'build_args<<TRINITY_EOF'
+            if [ "$KIND" = provenance ]; then
+              echo "VERSION=hq-${P_VERSION}"
+              echo "GIT_COMMIT=${P_GIT_COMMIT}"
+              echo "GIT_COMMIT_SUBJECT=${P_GIT_COMMIT_SUBJECT}"
+              echo "GIT_COMMIT_TIMESTAMP=${P_GIT_COMMIT_TIMESTAMP}"
+              echo "GIT_BRANCH=hq"
+              echo "BUILD_DATE=${P_BUILD_DATE}"
+            fi
+            echo 'TRINITY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          platforms: linux/amd64
+          cache-from: type=gha,scope=hq-${{ matrix.image }}
+          build-args: ${{ steps.args.outputs.build_args }}
