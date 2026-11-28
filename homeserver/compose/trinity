@@ -5,4 +5,10 @@
 # docker-compose.box.yml (default /srv/trinity).
 TRINITY_DIR=${TRINITY_DIR:-/srv/trinity}
 cd "$TRINITY_DIR" || { echo "trinity: cannot cd to $TRINITY_DIR" >&2; exit 1; }
+# release.env (written by homeserver/release/hs-release) pins the Determinity
+# images by digest; it is read on top of .env when present.
+if [ -f release.env ]; then
+  exec docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml \
+    --env-file .env --env-file release.env "$@"
+fi
 exec docker compose -p trinity -f docker-compose.hosted.yml -f docker-compose.box.yml "$@"

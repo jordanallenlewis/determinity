@@ -1,0 +1,20 @@
+[Unit]
+Description=Follow the latest Determinity release (health gate, automatic rollback)
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+# Any non-zero exit alerts: 1 = error, 2 = rolled back, 3 = schema moved (a person must restore),
+# 4 = broken (release and rollback both failed, a rollback or restore failed, or a run was
+# killed mid-switch): every later run exits 4 too until a person runs `hs-release clear-broken`.
+OnFailure=hs-release-alert.service
+
+[Service]
+Type=oneshot
+# Set TRINITY_DIR and the rest in this file (the variables are listed at the top of the script).
+EnvironmentFile=-/etc/default/hs-release
+# 45 min: a normal run is a few minutes (pull, pg_dump, ~90 s soak). The worst case that
+# still finishes is a slow but healthy new release (four probes of up to 300 s each, about
+# 21 min with the soak) or one that fails late and is then rolled back (the same again), plus
+# pulls and the dump, which can approach the limit. If systemd does kill it, hs-release has left an `inflight` note and the
+# next run records the state as broken (exit 4) instead of carrying on.
+TimeoutStartSec=45min
+ExecStart=/usr/local/sbin/hs-release apply

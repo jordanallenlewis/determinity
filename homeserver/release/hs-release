@@ -1,0 +1,1050 @@
+#!/usr/bin/env bash
+# Follow Determinity releases on a home server, with a health gate and
+# automatic rollback. No model, no GitHub token: it reads the public
+# releases API and the release.json attached to each release.
+#
+#   hs-release status            what runs now and what the latest release is
+#   hs-release check             exit 0 if up to date, 10 if a newer release exists
+#   hs-release apply [TAG]       switch to TAG (default: the latest release)
+#   hs-release rollback          switch back to what ran before the last apply
+#                                (refused if the database schema moved since)
+#   hs-release rollback --restore-db   restore the database backup taken before
+#                                that apply, then switch back
+#   hs-release rollback --db-restored  external database only: REQUIRED there (no schema check is possible): you
+#                                restored the external database yourself; run the previous images
+#   hs-release hold TAG          keep the timer from applying release TAG (lifted by
+#                                `apply TAG`, a rollback onto it, or deleting its line
+#                                from $STATE/refused)
+#   hs-release clear-broken [--force]  after a person has fixed a broken state
+#                                (below): run the health gate on what release.env
+#                                pins and, if it passes, lift the stop
+#
+# Environment (defaults in brackets):
+#   DETERMINITY_REPO   [jordanallenlewis/determinity]
+#   TRINITY_DIR        [/srv/trinity]  holds docker-compose.hosted.yml, .env,
+#                      docker-compose.box.yml; release.env is written here
+#   HS_RELEASE_STATE   [/var/lib/hs-release]  current.env, previous.env, log, backups/
+#   HS_RELEASE_KEEP_BACKUPS [5]  newest database dumps kept
+#   HS_RELEASE_MIN_AGE_HOURS [24]  the timer path (`apply` with no TAG) leaves a
+#                      latest release alone until it has been published this long
+#                      (0 = off); `apply TAG` by a person ignores it
+#   HS_RELEASE_AGENT_IMAGE [yes]  pull and re-tag images.agent when the release
+#                      has one; `no` leaves trinity-agent-base alone
+#   HS_RELEASE_FILES   [see below]  repo path=installed path, space separated:
+#                      where each homeserver/ file lives on this box, for the
+#                      drift warning
+#   HS_RELEASE_NOW     [now]  epoch seconds, a clock for tests
+#   HS_RELEASE_DEFAULTS [/etc/default/hs-release]  read by this script itself (KEY=VALUE
+#                      lines, # comments, optional quotes; never sourced), so a run by hand
+#                      sees what the units see; a variable already in the environment wins
+#   HEALTH_URL         [http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/health]
+#   SETUP_URL          [http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/api/setup/status]
+#   FRONTEND_URL       [http://127.0.0.1:${FRONTEND_PORT:-80}/]
+#   MCP_URL            [http://127.0.0.1:${BOX_MCP_PORT:-18080}/health]
+#   HEALTH_TIMEOUT     [300]  seconds the new release has to answer 200
+#   HEALTH_POLL        [5]    seconds between probes while waiting
+#   HEALTH_SOAK        [90]   seconds every service must then stay up, restart count unchanged
+#   HS_RELEASE_EXTERNAL_DB  [unset]  own-backups-no-rollback-across-migration: allow an external PostgreSQL
+#                      (no backup; a failed gate always blocks). Otherwise such an install is refused.
+#   COMPOSE            [docker compose -p trinity -f docker-compose.hosted.yml
+#                       -f docker-compose.box.yml --env-file .env --env-file release.env]
+#
+# What it pins: the four Determinity images by digest, through release.env
+# (DETERMINITY_{BACKEND,FRONTEND,SCHEDULER,MCP_SERVER}_IMAGE), which
+# docker-compose.box.yml reads. An optional fifth, images.agent, is pulled and
+# tagged locally as trinity-agent-base:latest (what the backend creates new
+# agents from); it is part of the rollback point. Everything else in the stack
+# is untouched.
+#
+# The timer path only moves forward: it never goes to a release whose version
+# (upstream semver, then the Determinity number) is lower than what runs, and it
+# waits for HS_RELEASE_MIN_AGE_HOURS.
+#
+# Two stop markers keep unattended runs from stacking changes on a bad state.
+# Both make the timer path do nothing and exit non-zero (so it alerts) every day
+# until a person acts, and `status` prints them first:
+#   $STATE/blocked  exit 3  the schema moved under a release that failed the gate;
+#                   images alone cannot go back. On PostgreSQL the backend and the
+#                   scheduler are left STOPPED (the failed release must not serve on a
+#                   moved schema); the file says so (services_stopped=). The fix is
+#                   `rollback --restore-db` (clears it). `apply TAG` by a person (fix
+#                   forward) also clears it once that release is healthy, and so does
+#                   `apply <the pinned tag>`, which starts the services and re-runs the gate.
+#   $STATE/broken   exit 4  the state is unknown: a release AND its rollback both
+#                   failed the gate, a manual rollback or a restore failed, or a
+#                   run was killed between switching and verifying. NOTHING
+#                   applies, timer or `apply TAG`, until `clear-broken`.
+#                   `rollback` and `rollback --restore-db` still run (they are the
+#                   repair tools) but do not clear it; `clear-broken` does, after the
+#                   health gate passes on what release.env pins.
+#
+# Exit codes: 0 ok / nothing to do, 1 error (nothing switched),
+#   2 the release failed the health gate and was rolled back (the rollback is
+#     healthy),
+#   3 blocked (above), also what the timer returns while that is unresolved,
+#   4 broken (above): returned when it is written and by every apply after; also
+#     when a failed release's backend and scheduler could not be stopped (first failure, a
+#     failed rollback while blocked, or a re-gate of a blocked release; a re-gate stopped by
+#     Ctrl-C or TERM settles the blocked file and exits 130 / 143).
+# "Running" is always what $TRINITY_DIR/release.env pins; current.env (the
+# last good full state) is brought in line with it whenever it changes.
+set -euo pipefail
+
+# The defaults file, read the way systemd's EnvironmentFile reads it, so a run by
+# hand sees the same settings as the timer (HS_RELEASE_EXTERNAL_DB, ports, the alert
+# URL). KEY=VALUE lines; blank lines and lines starting with # or ; are skipped;
+# surrounding quotes are stripped. The file is data: it is never sourced or
+# evaluated, a `$(...)` in it is just text. A variable already set in the
+# environment wins. HS_RELEASE_DEFAULTS moves the path (tests).
+load_defaults() {
+  local f=${HS_RELEASE_DEFAULTS:-/etc/default/hs-release} line k v
+  [ -f "$f" ] && [ -r "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    case $line in ''|'#'*|';'*) continue ;; esac
+    [[ $line == *=* ]] || continue
+    k=${line%%=*}; v=${line#*=}
+    [[ $k =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case $k in IFS|PS4|ENV|PATH|CDPATH|GLOBIGNORE|POSIXLY_CORRECT|BASH*|SHELL*|LD_*) continue ;; esac   # nothing that changes how this shell runs or finds commands
+    [ -z "${!k+x}" ] || continue
+    if [ "${#v}" -ge 2 ]; then
+      case $v in
+        \"*\") v=${v:1:${#v}-2} ;;
+        \'*\') v=${v:1:${#v}-2} ;;
+      esac
+    fi
+    export "$k=$v"
+  done < "$f"
+}
+load_defaults
+
+REPO=${DETERMINITY_REPO:-jordanallenlewis/determinity}
+TRINITY_DIR=${TRINITY_DIR:-/srv/trinity}
+STATE=${HS_RELEASE_STATE:-/var/lib/hs-release}
+KEEP_BACKUPS=${HS_RELEASE_KEEP_BACKUPS:-5}
+HEALTH_URL=${HEALTH_URL:-http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/health}
+SETUP_URL=${SETUP_URL:-http://127.0.0.1:${BOX_BACKEND_PORT:-8000}/api/setup/status}
+FRONTEND_URL=${FRONTEND_URL:-http://127.0.0.1:${FRONTEND_PORT:-80}/}
+MCP_URL=${MCP_URL:-http://127.0.0.1:${BOX_MCP_PORT:-18080}/health}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-300}
+HEALTH_SOAK=${HEALTH_SOAK:-90}
+HEALTH_SOAK_STEP=${HEALTH_SOAK_STEP:-5}
+HEALTH_POLL=${HEALTH_POLL:-5}
+MIN_AGE_HOURS=${HS_RELEASE_MIN_AGE_HOURS:-24}
+USE_AGENT=${HS_RELEASE_AGENT_IMAGE:-yes}
+# Where each homeserver/ file is installed (RELEASES.md, "Install"): the one
+# place this mapping is defined. Override the whole list in /etc/default/hs-release.
+INSTALLED_FILES=${HS_RELEASE_FILES:-"\
+homeserver/release/hs-release=/usr/local/sbin/hs-release \
+homeserver/release/hs-release-alert=/usr/local/sbin/hs-release-alert \
+homeserver/release/hs-release.service=/etc/systemd/system/hs-release.service \
+homeserver/release/hs-release-alert.service=/etc/systemd/system/hs-release-alert.service \
+homeserver/release/hs-release.timer=/etc/systemd/system/hs-release.timer \
+homeserver/compose/docker-compose.box.yml=$TRINITY_DIR/docker-compose.box.yml"}
+API=${GITHUB_API:-https://api.github.com}
+ASSET_PREFIX=${HS_RELEASE_ASSET_PREFIX:-https://github.com/$REPO/releases/download/}
+SERVICES="backend frontend scheduler mcp-server"
+AGENT_TAG=trinity-agent-base:latest   # the local tag the backend creates agents from
+RELEASE_RE='^v[0-9]+\.[0-9]+\.[0-9]+-determinity\.[0-9]+$'
+RELEASE_AUTHOR='github-actions[bot]'
+
+# Loud exits only reach a person when a usable alert URL is set (hs-release-alert);
+# otherwise they are a journal line. Say so on every loud exit and in `status`.
+# systemd's EnvironmentFile only treats a line that STARTS with # as a comment, so
+# `HS_RELEASE_ALERT_URL=https://x   # note` reaches the units as one value with the
+# comment inside it: that is invalid here (whitespace or #), not "set".
+alert_url_problem() {  # prints why HS_RELEASE_ALERT_URL is unusable; nothing when unset or fine
+  local u=${HS_RELEASE_ALERT_URL:-}
+  [ -n "$u" ] || return 0
+  case $u in
+    *[[:space:]]*) echo "it contains whitespace (a comment after the value? systemd does not strip it)" ;;
+    *'#'*) echo "it contains # (a comment after the value? systemd does not strip it)" ;;
+    http://?*|https://?*) ;;
+    *) echo "it does not start with http:// or https://" ;;
+  esac
+}
+alert_unset_line() {
+  local why
+  if [ -z "${HS_RELEASE_ALERT_URL:-}" ]; then
+    echo "WARNING: HS_RELEASE_ALERT_URL is not set: a failed run only reaches the journal, nobody is told. Set it in /etc/default/hs-release, then run: hs-release-alert --test"
+  elif why=$(alert_url_problem) && [ -n "$why" ]; then
+    echo "WARNING: HS_RELEASE_ALERT_URL is set but invalid: $why. A failed run only reaches the journal, nobody is told. Fix it in /etc/default/hs-release (the comment goes on its own line), then run: hs-release-alert --test"
+  fi
+}
+loud_exit_warning() {
+  local rc=$?
+  case $rc in 0|10|64) return 0 ;; esac
+  alert_unset_line >&2
+}
+
+log() { printf '%s hs-release: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$STATE/log" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# Images must come from this repo's owner. The owner is lowercased because GHCR
+# names are; anything odd in $REPO is refused rather than escaped.
+[[ $REPO =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "hs-release: bad DETERMINITY_REPO: $REPO" >&2; exit 1; }
+OWNER=${REPO%%/*}; OWNER=${OWNER,,}
+
+compose() {
+  # The status is taken explicitly: a bare `return` in a function called from a trap
+  # handler (regate_interrupted) reports the status from before the trap, not the command's.
+  local rc=0
+  if [ -n "${COMPOSE:-}" ]; then (cd "$TRINITY_DIR" && $COMPOSE "$@") || rc=$?; return "$rc"; fi
+  (cd "$TRINITY_DIR" && docker compose -p trinity -f docker-compose.hosted.yml \
+     -f docker-compose.box.yml --env-file .env --env-file release.env "$@") || rc=$?
+  return "$rc"
+}
+
+var_for() {  # backend -> DETERMINITY_BACKEND_IMAGE
+  local s=${1^^}; echo "DETERMINITY_${s//-/_}_IMAGE"
+}
+
+# What runs is what release.env pins, never a copy that could lag behind it.
+current_tag() { tag_of "$TRINITY_DIR/release.env"; }
+now() { echo "${HS_RELEASE_NOW:-$(date +%s)}"; }
+tag_of() { sed -n 's/^DETERMINITY_RELEASE=//p' "$1" 2>/dev/null || true; }
+meta_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1 || true; }  # $1 file, $2 key
+
+# The one place that decides whether an image ref may reach release.env. The
+# whole string must match: a prefix match let `docker.io/x/y@sha256:..` or a
+# ref with a newline (a second env line) through.
+valid_ref() {  # $1 = service (or agent), $2 = ref
+  local re="^ghcr\.io/$OWNER/determinity-$1@sha256:[0-9a-f]{64}\$"
+  case $2 in *$'\n'*|*$'\r'*) return 1 ;; esac
+  [[ $2 =~ $re ]]
+}
+
+held() { grep -qxF "$1" "$STATE/refused" 2>/dev/null; }
+# Rewritten through a line filter (temp file + rename) and read back: a file whose
+# last line has no newline must not swallow the new line. Fails, with a message, when
+# the tag is not held afterwards.
+hold_add() {
+  local f=$STATE/refused l
+  held "$1" && return 0
+  if ! {
+    if [ -f "$f" ]; then
+      while IFS= read -r l || [ -n "$l" ]; do printf '%s\n' "$l"; done < "$f"
+    fi
+    printf '%s\n' "$1"
+  } > "$f.new" 2>/dev/null || ! mv "$f.new" "$f" 2>/dev/null || ! held "$1"; then
+    log "ERROR: could not record the hold on $1 in $f; the timer may still apply it"
+    return 1
+  fi
+}
+held_reasons() {
+  echo "it failed the health gate here, it was rolled back from, or a person applied an older release (or ran hs-release hold) so the timer stays; lifted by hs-release apply <that tag> or by deleting its line from $STATE/refused"
+}
+hold_clear() {
+  [ -f "$STATE/refused" ] || return 0
+  grep -vxF "$1" "$STATE/refused" > "$STATE/refused.new" || true
+  mv "$STATE/refused.new" "$STATE/refused"
+}
+
+# ---- stop markers (see the header) ------------------------------------------
+# Bring current.env in line with what release.env pins.
+sync_current() { [ -s "$TRINITY_DIR/release.env" ] && cp "$TRINITY_DIR/release.env" "$STATE/current.env" || true; }
+
+# $1 = kind, $2 = reason, $3 = release tag to hold (optional). broken_mark writes the
+# marker, makes current.env match the pin and drops the in-flight note; broken_exit
+# also logs and exits 4.
+broken_mark() {
+  local kind=$1 why=$2 hold=${3:-}
+  printf 'kind=%s\nsince=%s\npinned=%s\nreason=%s\n' "$kind" "$(date -u +%FT%TZ)" "$(current_tag)" "$why" > "$STATE/broken"
+  [ -z "$hold" ] || hold_add "$hold" || true
+  sync_current
+  rm -f "$STATE/inflight"
+}
+broken_exit() {
+  local kind=$1 why=$2 hold=${3:-}
+  broken_mark "$kind" "$why" "$hold"
+  log "BROKEN ($kind): $why. release.env pins $(current_tag || true), which is NOT verified healthy. No hs-release apply will run (exit 4) until a person fixes it and runs: hs-release clear-broken"
+  exit 4
+}
+broken_line() {  # for status: one line, or nothing
+  [ -f "$STATE/broken" ] || return 0
+  echo "BROKEN since $(meta_get "$STATE/broken" since) ($(meta_get "$STATE/broken" kind)): $(meta_get "$STATE/broken" reason); apply refuses (exit 4) until: hs-release clear-broken"
+}
+inflight_begin() { printf 'op=%s\ntag=%s\nstarted=%s\n' "$1" "$2" "$(date -u +%FT%TZ)" > "$STATE/inflight"; }
+inflight_end() { rm -f "$STATE/inflight"; }
+
+# ---- versions: v<upstream>-determinity.<n> ---------------------------------
+# Prints "a b c n" (numbers, leading zeros dropped) or fails. Compared field by
+# field; never as semver (a Determinity version looks like a semver pre-release).
+ver_key() {
+  local re='^v([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})-determinity\.([0-9]{1,9})$'
+  [[ $1 =~ $re ]] || return 1
+  echo "$((10#${BASH_REMATCH[1]})) $((10#${BASH_REMATCH[2]})) $((10#${BASH_REMATCH[3]})) $((10#${BASH_REMATCH[4]}))"
+}
+ver_lt() {  # $1 < $2 ? fails with status 2 when either does not parse
+  local ka kb i; local -a x y
+  ka=$(ver_key "$1") || return 2; kb=$(ver_key "$2") || return 2
+  read -ra x <<<"$ka"; read -ra y <<<"$kb"
+  for i in 0 1 2 3; do
+    [ "${x[$i]}" -eq "${y[$i]}" ] && continue
+    [ "${x[$i]}" -lt "${y[$i]}" ]; return
+  done
+  return 1
+}
+
+# ---- drift: homeserver/ files do not follow a release ----------------------
+# release.json may carry homeserver_files {repo path: sha256}. Compare those with
+# an installed location in $INSTALLED_FILES; a warning only, never a block.
+drift_message() {  # $1 = release.json; prints one line when files differ
+  local rel=$1 tag repo want inst have bad="" e
+  tag=$(jq -r '.tag // ""' <<<"$rel")
+  while IFS=$'\t' read -r repo want; do
+    [ -n "$repo" ] || continue
+    inst=""
+    for e in $INSTALLED_FILES; do [ "${e%%=*}" = "$repo" ] && inst=${e#*=}; done
+    [ -n "$inst" ] || continue
+    if [ -f "$inst" ]; then have=$(sha256sum < "$inst" | cut -d' ' -f1); else have=missing; fi
+    [ "$have" = "$want" ] || bad="$bad $repo"
+  done < <(jq -r '(.homeserver_files // {}) | if type == "object" then to_entries[] | select((.key | test("^[A-Za-z0-9._/-]+$")) and (.value | type == "string") and (.value | test("^[0-9a-f]{64}$"))) | [.key, .value] | @tsv else empty end' <<<"$rel" 2>/dev/null)
+  [ -z "$bad" ] || echo "homeserver files differ from release $tag:$bad; re-run install from tag $tag (RELEASES.md, \"Install\")"
+}
+
+# Release metadata: refuses drafts, pre-releases, tags outside the scheme,
+# releases not published by the release workflow, and images outside this repo.
+fetch_release() {  # $1 = tag or "latest"; prints release.json
+  local url meta tag asset author published uploader
+  if [ "$1" = latest ]; then url="$API/repos/$REPO/releases/latest"
+  else url="$API/repos/$REPO/releases/tags/$1"; fi
+  meta=$(curl -fsS -H 'Accept: application/vnd.github+json' "$url") || die "cannot read $url"
+  tag=$(jq -r .tag_name <<<"$meta")
+  [ "$(jq -r .draft <<<"$meta")" = false ] || die "$tag is a draft"
+  [ "$(jq -r .prerelease <<<"$meta")" = false ] || die "$tag is a pre-release"
+  [[ $tag =~ $RELEASE_RE ]] || die "$tag is not a Determinity release tag"
+  author=$(jq -r '.author.login // ""' <<<"$meta")
+  [ "$author" = "$RELEASE_AUTHOR" ] || die "$tag was published by '$author', not $RELEASE_AUTHOR"
+  published=$(jq -r '.published_at // ""' <<<"$meta")
+  asset=$(jq -r '.assets[] | select(.name == "release.json") | .browser_download_url' <<<"$meta")
+  [ -n "$asset" ] || die "$tag has no release.json"
+  uploader=$(jq -r '[.assets[] | select(.name == "release.json") | .uploader.login // ""][0] // ""' <<<"$meta")
+  [ "$uploader" = "$RELEASE_AUTHOR" ] || die "$tag: release.json was uploaded by '$uploader', not $RELEASE_AUTHOR"
+  [[ $asset == "$ASSET_PREFIX"* ]] || die "$tag: release.json is not hosted under $ASSET_PREFIX"
+  # test("[^!-~]") rejects any character outside visible ASCII, so a newline
+  # anywhere (even trailing, which $(...) would strip later) fails here.
+  curl -fsSL "$asset" | jq -e --arg t "$tag" --arg o "$OWNER" --arg p "$published" '
+      def ok($svc): type == "object" and (.ref | type == "string")
+          and (.ref | test("[^!-~]") | not)
+          and (.ref | test("^ghcr\\.io/" + $o + "/determinity-" + $svc + "@sha256:[0-9a-f]{64}$"));
+      select(.schema == "determinity-release/1" and .tag == $t and .channel == "stable")
+      | select(.images.backend | ok("backend"))
+      | select(.images.frontend | ok("frontend"))
+      | select(.images.scheduler | ok("scheduler"))
+      | select(.images["mcp-server"] | ok("mcp-server"))
+      | select(.images.agent == null or (.images.agent | ok("agent")))
+      | . + {published_at: $p}' \
+    || die "$tag: release.json does not match the contract"
+}
+
+env_from_release() {  # release.json on stdin -> release.env text; checks every ref again
+  local rel s ref tag; rel=$(cat)
+  tag=$(jq -r .tag <<<"$rel")
+  [[ $tag =~ $RELEASE_RE ]] || die "refusing to write release.env: bad tag"
+  echo "DETERMINITY_RELEASE=$tag"
+  for s in $SERVICES; do
+    ref=$(jq -r --arg s "$s" '.images[$s].ref' <<<"$rel")
+    valid_ref "$s" "$ref" || die "refusing to write release.env: bad $s image ref"
+    echo "$(var_for "$s")=$ref"
+  done
+}
+
+agent_ref_from_release() {  # release.json on stdin -> agent ref, or nothing
+  local rel ref; rel=$(cat)
+  ref=$(jq -r '.images.agent.ref // empty' <<<"$rel")
+  [ -n "$ref" ] || return 0
+  [ "$USE_AGENT" != no ] || return 0   # opt-out: HS_RELEASE_AGENT_IMAGE=no
+  valid_ref agent "$ref" || die "refusing the agent image: bad ref"
+  echo "$ref"
+}
+
+agent_id() { docker image inspect --format '{{.Id}}' "$AGENT_TAG" 2>/dev/null || true; }
+
+retag_agent() {  # $1 = image id or ref to make trinity-agent-base:latest again
+  [ -n "$1" ] || return 0
+  docker tag "$1" "$AGENT_TAG" || log "WARNING: could not re-tag the agent image from $1"
+}
+
+# The digest ref of a running container's image. A tag can move between now
+# and a rollback, so the rollback point is by digest or it is not taken:
+# prefer the RepoDigests entry of the image's own repository.
+digest_ref_for() {  # $1 = container id; prints repo@sha256:..., or fails
+  local cfg imgid repo ref re='^[^[:space:]@]+@sha256:[0-9a-f]{64}$'
+  cfg=$(docker inspect --format '{{.Config.Image}}' "$1") || return 1
+  if [[ $cfg =~ $re ]]; then printf '%s' "$cfg"; return 0; fi
+  imgid=$(docker inspect --format '{{.Image}}' "$1") || return 1
+  repo=${cfg%%@*}; [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+  ref=$(docker image inspect --format '{{json .RepoDigests}}' "$imgid" 2>/dev/null \
+        | jq -r --arg r "$repo" '(. // []) as $d | ([$d[] | select(startswith($r + "@"))] + $d)[0] // empty' 2>/dev/null) || return 1
+  [[ $ref =~ $re ]] || return 1
+  printf '%s' "$ref"
+}
+
+# What runs now, as a release.env, so the first switch can roll back to it.
+# Fails (the caller refuses the switch) when a service is not running or has no
+# resolvable digest.
+env_from_running() {
+  local s id ref
+  echo "DETERMINITY_RELEASE=$(current_tag)"
+  for s in $SERVICES; do
+    id=$(compose ps -q "$s" 2>/dev/null | head -1)
+    [ -n "$id" ] || { log "service $s is not running; cannot record a rollback point"; return 1; }
+    ref=$(digest_ref_for "$id") \
+      || { log "service $s runs an image with no repo digest (not pulled from a registry, or its digest is unknown); cannot record a rollback point that cannot move"; return 1; }
+    echo "$(var_for "$s")=$ref"
+  done
+}
+
+# ---- database ---------------------------------------------------------------
+# Which database the install runs on is decided from the backend's effective
+# DATABASE_URL (`compose config --format json`, i.e. the install's .env plus
+# release.env and the override file, exactly as compose resolves them), never
+# from whether a postgres service is defined: docker-compose.hosted.yml always
+# defines one. The URL is parsed here and never logged (it holds a password).
+#   bundled: scheme postgresql(+driver)/postgres, host exactly `postgres`, port
+#            empty or 5432, database name equal to the postgres service's POSTGRES_DB,
+#            no query string, one `@` -> PostgreSQL path: backup, schema tracked,
+#            restorable (DB_MODE=pg)
+#   sqlite:... (explicit)                  -> SQLite path: code-only rollback,
+#                                             Trinity keeps its own copy (DB_MODE=sqlite)
+#   anything else postgres-like (external, or a URL that cannot be shown to be the
+#   bundled one: a query string, a second `@`, another database name)
+#                                          -> refused, unless /etc/default/hs-release
+#                                             sets HS_RELEASE_EXTERNAL_DB=own-backups-no-rollback-across-migration
+#                                             (DB_MODE=external: no backup, the
+#                                             schema is treated as moved, so a
+#                                             failed gate always blocks)
+#   set but empty (upstream's SQLite switch)  -> SQLite path, as sqlite:...
+#   no backend service, no DATABASE_URL, null -> refused (nothing is guessed)
+# The pg commands run inside the bundled container over its local socket with its
+# own POSTGRES_USER / POSTGRES_DB (both `trinity`), so no password is handled.
+EXTERNAL_OK=own-backups-no-rollback-across-migration
+DB_MODE=""
+# $1 = URL, $2 = the bundled POSTGRES_DB. Succeeds only for the bundled service.
+is_bundled_url() {
+  local url=$1 dbname=$2 re='^(postgres|postgresql)(\+[a-z0-9]+)?://([^/?#@]*)@([^/?#@]*)/([^/?#@]*)$'
+  [ -n "$dbname" ] || return 1
+  [[ $url =~ $re ]] || return 1
+  local hostport=${BASH_REMATCH[4]} name=${BASH_REMATCH[5]}
+  [[ $hostport =~ ^postgres(:(5432)?)?$ ]] || return 1
+  [ "$name" = "$dbname" ]
+}
+db_mode() {
+  [ -z "$DB_MODE" ] || return 0
+  local cfg url dbname
+  cfg=$(compose config --format json 2>/dev/null) || die "cannot read the compose configuration (compose config failed); not deciding the database blind"
+  # "S:" + the value when the key is set to a string (possibly empty); nothing
+  # when the service or key is missing or the value is null.
+  url=$(jq -er '.services.backend.environment
+      | if type == "array" then (map(select(type == "string" and startswith("DATABASE_URL="))) | .[0] // empty | sub("^DATABASE_URL="; "S:"))
+        elif type == "object" then (.DATABASE_URL | if type == "string" then "S:" + . else empty end)
+        else empty end' <<<"$cfg" 2>/dev/null) || url=""
+  [ -n "$url" ] || die "the backend has no DATABASE_URL in the compose configuration (service missing, key missing or null); not guessing the database. Set it to the bundled PostgreSQL URL, an sqlite: URL, an external database, or empty for SQLite"
+  url=${url#S:}
+  # Set but empty is upstream's documented SQLite switch (docker-compose.hosted.yml,
+  # backend DATABASE_URL comment: `DATABASE_URL=` keeps the release on SQLite).
+  [ -n "$url" ] || url="sqlite:(empty DATABASE_URL)"
+  dbname=$(jq -r '.services.postgres.environment
+      | if type == "array" then (map(select(type == "string" and startswith("POSTGRES_DB="))) | .[0] // "" | sub("^POSTGRES_DB="; ""))
+        elif type == "object" then (.POSTGRES_DB // "" | tostring)
+        else "" end' <<<"$cfg" 2>/dev/null) || dbname=""
+  case "$url" in
+    sqlite:*|sqlite+*) DB_MODE=sqlite ;;
+    *)
+      if is_bundled_url "$url" "$dbname"; then
+        [ -n "$(compose ps -q postgres 2>/dev/null | head -1)" ] \
+          || die "the bundled postgres service is not running; refusing to switch without a backup"
+        DB_MODE=pg
+      else
+        [ "${HS_RELEASE_EXTERNAL_DB:-}" = "$EXTERNAL_OK" ] \
+          || die "the backend uses an external database (not the bundled PostgreSQL, or a URL that cannot be shown to be); hs-release takes no backup of it and cannot roll back across a migration. Set HS_RELEASE_EXTERNAL_DB=$EXTERNAL_OK in /etc/default/hs-release only if you take your own backups and accept that"
+        DB_MODE=external
+      fi ;;
+  esac
+}
+is_pg() { db_mode; [ "$DB_MODE" = pg ]; }
+pg_sh() { compose exec -T postgres sh -c "$1"; }  # stdin and stdout pass through
+
+db_rev() {  # prints the Alembic revision, or fails
+  local r
+  r=$(pg_sh 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version"') || return 1
+  # Exactly one row: more than one is not a revision this can vouch for.
+  [ "$(printf '%s\n' "$r" | grep -c '[^[:space:]]')" = 1 ] || return 1
+  r=$(printf '%s' "$r" | tr -d '[:space:]')
+  [[ $r =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  printf '%s' "$r"
+}
+
+backup_db() {  # $1 = label; prints the dump path; fails on an empty or non-dump file
+  local f
+  mkdir -p "$STATE/backups"; chmod 700 "$STATE/backups"
+  f="$STATE/backups/${1:-none}-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  if ! (umask 077; pg_sh 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$f.part") \
+     || [ ! -s "$f.part" ] || [ "$(head -c5 "$f.part")" != PGDMP ]; then
+    rm -f "$f.part"; return 1
+  fi
+  mv "$f.part" "$f"
+  # Newest N kept, by mtime.
+  # shellcheck disable=SC2012
+  # The dumps previous.meta and blocked name are never pruned.
+  local keep1 keep2
+  keep1=$(meta_get "$STATE/previous.meta" BACKUP); keep2=$(meta_get "$STATE/blocked" backup)
+  ls -1t "$STATE"/backups/*.dump 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do
+    { [ -n "$keep1" ] && [ "$old" = "$keep1" ]; } || { [ -n "$keep2" ] && [ "$old" = "$keep2" ]; } || rm -f "$old"
+  done
+  printf '%s' "$f"
+}
+
+restore_cmd() {  # the restore, for a person; $1 = backup path
+  cat <<MSG
+  hs-release rollback --restore-db        (restores $1, then runs the previous images)
+by hand, as root ('hs-trinity' is the compose wrapper):
+  hs-trinity stop backend scheduler mcp-server
+  hs-trinity exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"'
+  hs-trinity exec -T postgres sh -c 'pg_restore -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" --no-owner' < $1
+  then put the previous images back (see RELEASES.md, "Rolling back")
+MSG
+}
+
+# ---- health gate ------------------------------------------------------------
+wait_url() {  # $1 = url, $2 = what, $3 = optional jq -e filter for the body
+  local deadline body
+  deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+  while :; do
+    if body=$(curl -fsS -m 10 "$1" 2>/dev/null) \
+       && { [ -z "${3:-}" ] || jq -e "$3" >/dev/null 2>&1 <<<"$body"; }; then return 0; fi
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep "$HEALTH_POLL"
+  done
+  log "health: $2 ($1) did not answer correctly within ${HEALTH_TIMEOUT}s"
+  return 1
+}
+
+svc_state() { docker inspect --format '{{.State.Running}} {{.RestartCount}}' "$1"; }
+
+# 1. every service runs the pinned image; 2. the backend, a database read
+# through it, the frontend and mcp-server answer; 3. for HEALTH_SOAK seconds no
+# service stops, restarts or is recreated (a crash loop answers 200 between
+# crashes, which is why a single probe is not enough).
+# Database read: on PostgreSQL /health returns 200 without touching the
+# database (src/backend/main.py health_check), so it proves little. The
+# unauthenticated /api/setup/status reads system_settings through the app's own
+# connection pool, and alembic_version is read directly. Scraping the backend
+# log for tracebacks was not chosen: handled exceptions are logged with
+# tracebacks too, so it would roll back healthy releases.
+healthy() {
+  local s want id have i
+  local -a ids=() snap=()
+  for s in $SERVICES; do
+    want=$(sed -n "s/^$(var_for "$s")=//p" "$TRINITY_DIR/release.env")
+    id=$(compose ps -q "$s" | head -1)
+    [ -n "$id" ] || { log "health: $s has no container"; return 1; }
+    have=$(docker inspect --format '{{.Image}}' "$id")
+    [ "$have" = "$(docker image inspect --format '{{.Id}}' "$want")" ] \
+      || { log "health: $s runs $have, not $want"; return 1; }
+  done
+  wait_url "$HEALTH_URL" "backend" || return 1
+  wait_url "$SETUP_URL" "backend database read" 'has("setup_completed")' || return 1
+  if is_pg; then db_rev >/dev/null || { log "health: cannot read alembic_version"; return 1; }; fi
+  wait_url "$FRONTEND_URL" "frontend" || return 1
+  wait_url "$MCP_URL" "mcp-server" || return 1
+  for s in $SERVICES; do
+    id=$(compose ps -q "$s" | head -1)
+    ids+=("$id"); snap+=("$(svc_state "$id")")
+  done
+  local end=$(( $(date +%s) + HEALTH_SOAK ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    sleep "$HEALTH_SOAK_STEP"
+    i=0
+    for s in $SERVICES; do
+      id=$(compose ps -q "$s" | head -1)
+      [ "$id" = "${ids[$i]}" ] || { log "health: $s was recreated during the ${HEALTH_SOAK}s soak"; return 1; }
+      [ "$(svc_state "$id")" = "${snap[$i]}" ] \
+        || { log "health: $s stopped or restarted during the ${HEALTH_SOAK}s soak"; return 1; }
+      i=$((i+1))
+    done
+  done
+  curl -fsS -m 10 -o /dev/null "$HEALTH_URL" || { log "health: backend stopped answering after the soak"; return 1; }
+}
+
+switch_to() {  # $1 = file with release.env content
+  cp "$1" "$TRINITY_DIR/release.env.new"
+  mv "$TRINITY_DIR/release.env.new" "$TRINITY_DIR/release.env"
+  # shellcheck disable=SC2046
+  compose up -d --no-build $(echo $SERVICES)
+}
+
+lock() { exec 9>"$STATE/lock"; flock -n 9 || die "another hs-release is running"; }
+
+# The rollback point an apply is about to replace, kept so an automatic rollback
+# can put it back (after it, `previous` must still be the release before the one
+# rolled back to, or `rollback` would be a no-op).
+save_previous() {
+  rm -f "$STATE/previous.env.pre" "$STATE/previous.meta.pre"
+  [ ! -f "$STATE/previous.env" ] || cp "$STATE/previous.env" "$STATE/previous.env.pre"
+  [ ! -f "$STATE/previous.meta" ] || cp "$STATE/previous.meta" "$STATE/previous.meta.pre"
+}
+restore_previous() {
+  if [ -f "$STATE/previous.env.pre" ]; then mv "$STATE/previous.env.pre" "$STATE/previous.env"; else rm -f "$STATE/previous.env"; fi
+  if [ -f "$STATE/previous.meta.pre" ]; then mv "$STATE/previous.meta.pre" "$STATE/previous.meta"; else rm -f "$STATE/previous.meta"; fi
+}
+
+# Rewrites services_stopped= in the blocked file so it says what is really stopped.
+set_blocked_stopped() {
+  [ -f "$STATE/blocked" ] || return 0
+  { grep -v '^services_stopped=' "$STATE/blocked" || true; printf 'services_stopped=%s\n' "$1"; } > "$STATE/blocked.new"
+  mv "$STATE/blocked.new" "$STATE/blocked"
+}
+
+# `apply <pinned tag>` while blocked: start the services and run the health gate
+# again. Anything that can refuse (the database check, compose config) runs BEFORE
+# the first change. On the bundled PostgreSQL every non-pass exit stops backend
+# and scheduler again; on any other database nothing is ever stopped (policy).
+# Exits: 0 healthy and unblocked, 3 still blocked, 4 the stop failed (the failed
+# release may be serving on the moved schema), 1 refused before any change.
+# A Ctrl-C or TERM during the re-gate must not leave backend and scheduler running
+# under a note that says a re-gate is running: settle the blocked file the way a
+# failed gate does (bundled PostgreSQL: stop them again; any other database: nothing
+# is ever stopped), then exit 130 (INT) / 143 (TERM). $1 = the exit status.
+regate_interrupted() {
+  local rc=$1
+  trap '' INT TERM
+  if [ "$DB_MODE" = pg ]; then
+    if compose stop backend scheduler; then
+      set_blocked_stopped "backend scheduler"
+      inflight_end
+      log "re-gate interrupted: backend and scheduler stopped again; staying blocked"
+    else
+      set_blocked_stopped "FAILED (the stop failed: the failed release may be serving on the moved schema; check docker ps)"
+      broken_mark regate-stop-failed "the re-gate was interrupted and backend and scheduler could NOT be stopped: the failed release may be serving on a moved schema (services_stopped=FAILED in $STATE/blocked)"
+      log "BROKEN (regate-stop-failed): the re-gate was interrupted and backend and scheduler could NOT be stopped; check docker ps. No hs-release apply will run (exit 4) until a person fixes it and runs: hs-release clear-broken"
+    fi
+  else
+    set_blocked_stopped none
+    inflight_end
+    log "re-gate interrupted: nothing was stopped (not the bundled PostgreSQL); staying blocked"
+  fi
+  exit "$rc"
+}
+
+# After a gate that failed while blocked and the services were started again: on the
+# bundled PostgreSQL stop backend and scheduler and record it; on any other database
+# nothing is ever stopped. Fails when the stop failed (the file then says FAILED).
+blocked_settle() {
+  [ -f "$STATE/blocked" ] || return 0
+  if ! is_pg; then set_blocked_stopped none; return 0; fi
+  if compose stop backend scheduler; then set_blocked_stopped "backend scheduler"; return 0; fi
+  set_blocked_stopped "FAILED (the stop failed: the failed release may be serving on the moved schema; check docker ps)"
+  return 1
+}
+
+regate_blocked() {
+  local tag=$1 up=yes
+  db_mode
+  trap 'regate_interrupted 130' INT
+  trap 'regate_interrupted 143' TERM
+  if [ "$DB_MODE" = pg ]; then
+    log "$tag is pinned but blocked: starting backend and scheduler and re-running the health gate"
+    set_blocked_stopped "unknown (a re-gate is running: backend and scheduler were started; if this note stays, check docker ps)"
+  else
+    log "$tag is pinned but blocked: re-running the health gate (this database is not the bundled PostgreSQL, so no service is ever stopped)"
+  fi
+  inflight_begin apply "$tag"
+  # shellcheck disable=SC2046
+  compose up -d --no-build $(echo $SERVICES) || up=no
+  if [ "$up" = yes ] && healthy; then
+    # Passed: from here a signal must not stop the now-healthy services.
+    trap - INT TERM
+    sync_current
+    hold_clear "$tag"
+    rm -f "$STATE/blocked" "$STATE/attempt.env"
+    inflight_end
+    log "on $tag (healthy); blocked cleared"
+    return 0
+  fi
+  if [ "$DB_MODE" != pg ]; then
+    set_blocked_stopped none
+    inflight_end
+    trap - INT TERM
+    if [ "$up" = no ]; then
+      log "$tag: compose up failed. Nothing was stopped. Staying blocked (not the bundled PostgreSQL)"
+    else
+      log "$tag is still failing the health gate; nothing was stopped (not the bundled PostgreSQL): its services are still running and not verified healthy; staying blocked"
+    fi
+    return 3
+  fi
+  if compose stop backend scheduler; then
+    set_blocked_stopped "backend scheduler"
+    inflight_end
+    trap - INT TERM
+    log "$tag is still failing the health gate; backend and scheduler stopped again; staying blocked"
+    return 3
+  fi
+  trap - INT TERM
+  set_blocked_stopped "FAILED (the stop failed: the failed release may be serving on the moved schema; check docker ps)"
+  broken_exit regate-stop-failed "$tag failed the health gate again and backend and scheduler could NOT be stopped: the failed release may be serving on a moved schema (services_stopped=FAILED in $STATE/blocked)"
+}
+
+cmd_apply() {
+  local want=${1:-latest} rel tag tmp s agent_ref agent_before="" rev_before="" backup="" pg=no rev_after
+  local stopped_svcs="" hold_latest="" latest_tag="" warn_unread_latest=no cur drift published ready rc keep_prev=no old_blocked_backup="" old_blocked_before="" stopped=ok
+  [[ $MIN_AGE_HOURS =~ ^[0-9]+$ ]] || { echo "hs-release: bad HS_RELEASE_MIN_AGE_HOURS: $MIN_AGE_HOURS" >&2; return 1; }
+  mkdir -p "$STATE"
+  lock
+  if [ -f "$STATE/inflight" ] && [ ! -f "$STATE/broken" ]; then
+    broken_exit interrupted "an earlier run was killed or the host reset between switching and verifying ($(paste -sd' ' "$STATE/inflight"))"
+  fi
+  if [ -f "$STATE/broken" ]; then
+    log "NOT applying: $(broken_line)"
+    return 4
+  fi
+  if [ "$want" = latest ] && [ -f "$STATE/blocked" ]; then
+    log "NOT applying: a failed release left the database schema moved and a person has to restore it (see $STATE/blocked and RELEASES.md)"
+    return 3
+  fi
+  # While blocked, a person's apply must not replace the rollback point or the
+  # dump that `blocked` refers to: --restore-db has to keep targeting them.
+  if [ -f "$STATE/blocked" ]; then
+    keep_prev=yes
+    old_blocked_backup=$(meta_get "$STATE/blocked" backup)
+    old_blocked_before=$(meta_get "$STATE/blocked" schema_before)
+  fi
+  rel=$(fetch_release "$want")
+  tag=$(jq -r .tag <<<"$rel")
+  cur=$(current_tag)
+  drift=$(drift_message "$rel"); [ -z "$drift" ] || log "WARNING: $drift"
+  if [ "$tag" = "$cur" ]; then
+    if [ -f "$STATE/blocked" ] && [ "$want" != latest ]; then
+      regate_blocked "$tag"; return $?
+    fi
+    log "already on $tag"; return 0
+  fi
+  if [ "$want" = latest ]; then
+    # The timer path: a person names a tag to override any of these.
+    # A release that failed the gate here, or that a person rolled back from, is
+    # not picked up by the timer.
+    if held "$tag"; then
+      log "latest is $tag, which is refused/held here ($(held_reasons)); staying on $cur"
+      return 0
+    fi
+    # Forward only: a withdrawn or re-pointed latest must not downgrade the box.
+    if [ -n "$cur" ]; then
+      rc=0; ver_lt "$tag" "$cur" || rc=$?
+      if [ "$rc" = 2 ]; then log "cannot compare latest $tag with running $cur; staying on $cur"; return 0; fi
+      if [ "$rc" = 0 ]; then log "latest $tag is older than running $cur (withdrawn or re-pointed?); not downgrading, staying on $cur"; return 0; fi
+    fi
+    # Soak in the open: a release is not followed until it has been out a while.
+    published=$(jq -r '.published_at // ""' <<<"$rel")
+    [ -z "$published" ] || published=$(date -u -d "$published" +%s 2>/dev/null) || published=""
+    [ -n "$published" ] || die "$tag: cannot read published_at; not following it"
+    ready=$(( published + MIN_AGE_HOURS * 3600 ))
+    if [ "$(now)" -lt "$ready" ]; then
+      log "latest $tag is younger than ${MIN_AGE_HOURS}h; waiting until $(date -u -d "@$ready" +%FT%TZ); staying on ${cur:-what runs now}"
+      return 0
+    fi
+  else
+    hold_clear "$tag"
+    # A person's older tag must stay: hold the latest release so the timer does
+    # not move forward again tomorrow. Set after the switch is healthy.
+    latest_tag=$(fetch_release latest 2>/dev/null | jq -r '.tag // ""' 2>/dev/null) || latest_tag=""
+    if [ -n "$latest_tag" ] && [ "$latest_tag" != "$tag" ]; then
+      rc=0; ver_lt "$tag" "$latest_tag" || rc=$?
+      [ "$rc" != 0 ] || hold_latest=$latest_tag
+    elif [ -z "$latest_tag" ]; then
+      # Only a move back can be undone by the timer. Warn when $tag is older
+      # than what runs, or when that cannot be told (nothing pinned yet, or a
+      # tag that does not parse); a move forward needs no hold. Printed after
+      # the switch, next to its result.
+      if [ -z "$cur" ]; then warn_unread_latest=yes
+      else
+        rc=0; ver_lt "$tag" "$cur" || rc=$?
+        [ "$rc" = 1 ] || warn_unread_latest=yes
+      fi
+    fi
+  fi
+  touch "$TRINITY_DIR/release.env"
+  tmp=$(mktemp "$STATE/next.XXXXXX")
+  env_from_release <<<"$rel" > "$tmp"
+  agent_ref=$(agent_ref_from_release <<<"$rel")
+  # Pull everything first: a pull failure leaves the running release untouched.
+  for s in $SERVICES; do
+    docker pull -q "$(sed -n "s/^$(var_for "$s")=//p" "$tmp")" >/dev/null || die "pull failed for $s ($tag)"
+  done
+  [ -z "$agent_ref" ] || docker pull -q "$agent_ref" >/dev/null || die "pull failed for the agent image ($tag)"
+  # The rollback point: the last good state, or on the first switch what runs now.
+  if [ -f "$STATE/current.env" ]; then cp "$STATE/current.env" "$tmp.prev"
+  else env_from_running > "$tmp.prev" || { rm -f "$tmp.prev"; die "no rollback point by digest; refusing the first switch"; }; fi
+  # Backup and schema revision next: if either fails nothing has been switched.
+  if is_pg; then
+    pg=yes
+    rev_before=$(db_rev) || die "cannot read the Alembic revision; not switching"
+    backup=$(backup_db "${cur:-none}$([ "$keep_prev" = no ] || echo -retry)") || die "database backup failed or is empty; not switching"
+    log "database backed up to $backup (schema $rev_before)"
+  elif [ "$DB_MODE" = external ]; then
+    log "external database (HS_RELEASE_EXTERNAL_DB accepted): no backup taken; a release that fails the gate blocks instead of rolling back"
+  else
+    log "database is not PostgreSQL: no backup taken, schema not tracked; a rollback is code-only (Trinity keeps its own copy under ~/trinity-data/backups/)"
+  fi
+  # The in-flight note comes before the first change to the box (the agent
+  # re-tag), so a kill from here on is found by the next run.
+  inflight_begin apply "$tag"
+  if [ -n "$agent_ref" ]; then
+    agent_before=$(agent_id)
+    [ -n "$agent_before" ] || log "WARNING: no local $AGENT_TAG to roll the agent image back to"
+    docker tag "$agent_ref" "$AGENT_TAG" || { inflight_end; die "could not tag the agent image"; }
+  fi
+  if [ "$keep_prev" = yes ]; then
+    # This attempt rolls back to what runs now (the failed release, already on
+    # the moved schema); previous.* stay as they are.
+    mv "$tmp.prev" "$STATE/attempt.env"
+  else
+    save_previous
+    mv "$tmp.prev" "$STATE/previous.env"
+    printf 'SCHEMA_REV=%s\nBACKUP=%s\nAGENT_ID=%s\n' "$rev_before" "$backup" "$agent_before" > "$STATE/previous.meta"
+  fi
+  log "switching ${cur:-the upstream stack} -> $tag"
+  if switch_to "$tmp" && healthy; then
+    mv "$tmp" "$STATE/current.env"
+    rm -f "$STATE/previous.env.pre" "$STATE/previous.meta.pre" "$STATE/attempt.env"
+    hold_clear "$tag"
+    [ "$want" = latest ] || rm -f "$STATE/blocked"
+    inflight_end
+    log "on $tag (healthy)"
+    [ "$warn_unread_latest" != yes ] || log "WARNING: could not read the latest release, so no hold was set: the timer may move this box forward again past $tag. To keep it here, name the release to hold: hs-release hold <tag>"
+    if [ -n "$hold_latest" ]; then
+      hold_add "$hold_latest" || true
+      log "$tag is older than the latest release $hold_latest: $hold_latest is held so the timer stays on $tag. The hold on $hold_latest is lifted only by hs-release apply $hold_latest (a person naming it), a rollback that lands on it, or deleting its line from $STATE/refused; a release newer than $hold_latest is not held and the timer follows it once it is old enough"
+    fi
+    return 0
+  fi
+  log "$tag failed the health gate"
+  hold_add "$tag" || true
+  if [ "$pg" = yes ] || [ "$DB_MODE" = external ]; then
+    rev_after=""
+    if [ "$pg" = yes ]; then
+      # A failed backend may still be migrating: stop the writers before reading.
+      # They are NOT started again: a failed release on a moved schema must not serve.
+      compose stop backend scheduler || { stopped=failed; log "could not stop the backend and scheduler before reading the schema revision"; }
+      [ "$stopped" = ok ] && rev_after=$(db_rev 2>/dev/null || true)
+    fi
+    if [ "$DB_MODE" = external ] || [ -z "$rev_after" ] || [ "$rev_after" != "$rev_before" ]; then
+      # The new backend may have migrated: old code on a newer schema can crash
+      # or corrupt data. Leave the failed release pinned (release.env names it)
+      # and, on PostgreSQL, backend and scheduler STOPPED; record that, and stop
+      # the timer from stacking more changes on top.
+      mv "$tmp" "$STATE/current.env"
+      if [ "$keep_prev" = yes ]; then
+        # Keep naming the dump and revision from before the first failure.
+        rev_before=$old_blocked_before; backup=$old_blocked_backup; rm -f "$STATE/attempt.env"
+      fi
+      if [ "$DB_MODE" = external ]; then rev_after=unknown-external; fi
+      if [ "$DB_MODE" = external ]; then stopped_svcs=none
+      elif [ "$stopped" = ok ]; then stopped_svcs="backend scheduler"
+      else stopped_svcs="FAILED (the stop failed: the failed release may be serving on the moved schema; check docker ps)"; fi
+      printf 'tag=%s\nschema_before=%s\nschema_now=%s\nbackup=%s\nservices_stopped=%s\n' "$tag" "$rev_before" "${rev_after:-unreadable}" "$backup" "$stopped_svcs" > "$STATE/blocked"
+      inflight_end
+      if [ "$stopped" = failed ]; then
+        # A failed stop is a broken state, as on the re-gate path: the failed release
+        # may be serving on a moved schema.
+        restore_cmd "$backup" | tee -a "$STATE/log" >&2
+        broken_exit apply-stop-failed "$tag failed the health gate on a schema that may have moved and backend and scheduler could NOT be stopped: the failed release may be serving (services_stopped=FAILED in $STATE/blocked)"
+      fi
+      if [ "$DB_MODE" = external ]; then
+        log "$tag failed the gate on an external database: the schema is treated as moved, NOT rolling the images back; release.env still pins $tag and its services are still running (not verified healthy). Restore your own database backup, then run: hs-release rollback --db-restored"
+      else
+        log "SCHEMA MOVED ($rev_before -> ${rev_after:-unreadable}) and $tag failed the gate: NOT rolling the images back. release.env pins $tag; services_stopped=$stopped_svcs, the failed release is NOT serving. A person must restore the database backup:"
+        restore_cmd "$backup" | tee -a "$STATE/log" >&2
+      fi
+      exit 3
+    fi
+  fi
+  log "schema unchanged; rolling back"
+  rm -f "$tmp"
+  if [ "$keep_prev" = yes ]; then
+    switch_to "$STATE/attempt.env" || true
+    retag_agent "$agent_before"
+    rm -f "$STATE/attempt.env"
+  else
+    switch_to "$STATE/previous.env" || true
+    retag_agent "$agent_before"
+    restore_previous   # the rollback point from before this attempt
+  fi
+  if healthy; then
+    cp "$TRINITY_DIR/release.env" "$STATE/current.env"
+    inflight_end
+    log "rolled back to $(current_tag)"
+    exit 2
+  fi
+  broken_exit double-failure "$tag failed the health gate and so did the rollback to ${cur:-the upstream stack}" "$tag"
+}
+
+cmd_rollback() {
+  local why restored_from="" restore=no from to rev_now="" rev_prev backup agent_prev agent_now="" pre redone=no
+  case "${1:-}" in --restore-db) restore=yes ;; --db-restored) redone=yes ;; "") ;; *) echo "usage: hs-release rollback [--restore-db|--db-restored]" >&2; return 64 ;; esac
+  mkdir -p "$STATE"
+  lock
+  [ -f "$STATE/previous.env" ] || die "no previous release recorded"
+  from=$(current_tag); to=$(tag_of "$STATE/previous.env")
+  rev_prev=$(meta_get "$STATE/previous.meta" SCHEMA_REV)
+  backup=$(meta_get "$STATE/previous.meta" BACKUP)
+  agent_prev=$(meta_get "$STATE/previous.meta" AGENT_ID)
+  if is_pg; then
+    if [ "$restore" = yes ]; then
+      # An unreadable revision is the state a failed gate can leave; the check
+      # after the restore proves the result.
+      rev_now=$(db_rev) || log "cannot read the current Alembic revision; restoring anyway (the restored revision is checked afterwards)"
+    else
+      rev_now=$(db_rev) || die "cannot read the Alembic revision; not rolling back"
+    fi
+    if [ "$restore" = yes ]; then
+      [ -n "$backup" ] && [ -s "$backup" ] || die "no usable database backup recorded for $to (looked for '${backup:-none}'); see $STATE/backups/"
+      pre=$(backup_db "${from:-none}-prerestore") || die "could not back up the current database before restoring; not touching it"
+      log "current database saved to $pre; restoring $backup (schema $rev_prev)"
+      # From here the stack and the database are being changed: any failure leaves
+      # it in a state only a person can judge, so it is recorded as broken.
+      inflight_begin restore "$to"
+      compose stop backend scheduler mcp-server || broken_exit restore-failed "could not stop the services before the restore; pre-restore copy: $pre"
+      pg_sh 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"' >/dev/null \
+        || broken_exit restore-failed "could not reset the schema; pre-restore copy: $pre"
+      pg_sh 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-owner' < "$backup" \
+        || broken_exit restore-failed "pg_restore failed, the database may be incomplete; pre-restore copy: $pre, backup: $backup"
+      [ "$(db_rev || true)" = "$rev_prev" ] \
+        || broken_exit restore-failed "the restored database is not at schema $rev_prev; pre-restore copy: $pre"
+    elif [ -z "$rev_prev" ] || [ "$rev_now" != "$rev_prev" ]; then
+      log "REFUSED: the database schema is $rev_now but $to ran on ${rev_prev:-an unrecorded schema}; old images on a newer schema are not safe. Restore the backup instead:"
+      restore_cmd "${backup:-<none recorded; see $STATE/backups/>}" | tee -a "$STATE/log" >&2
+      exit 3
+    fi
+  else
+    [ "$restore" = no ] || die "--restore-db needs the bundled PostgreSQL; this install is not on it"
+    if [ "$DB_MODE" = external ]; then
+      # No schema check is possible here: the person says the database is back at
+      # what $to expects, or nothing happens.
+      [ "$redone" = yes ] || die "external database: hs-release cannot check its schema, so a rollback needs you to restore your own backup first and then run: hs-release rollback --db-restored"
+    else
+      [ "$redone" = no ] || die "--db-restored is for installs on an external database"
+    fi
+    log "database is not the bundled PostgreSQL: the rollback is code-only and the schema is not checked"
+  fi
+  [ -z "$agent_prev" ] || agent_now=$(agent_id)
+  inflight_begin rollback "$to"
+  if ! { switch_to "$STATE/previous.env" && retag_agent "$agent_prev" && healthy; }; then
+    # The switch started the services: a blocked file must say what is true now.
+    why="the rollback to ${to:-the previous state} (from ${from:-?}) did not pass the health gate"
+    blocked_settle || why="$why, and backend and scheduler could NOT be stopped afterwards (services_stopped=FAILED in $STATE/blocked)"
+    broken_exit rollback-failed "$why" "$from"
+  fi
+  cp "$STATE/current.env" "$STATE/next-rollback.env" 2>/dev/null || true
+  cp "$STATE/previous.env" "$STATE/current.env"
+  [ -f "$STATE/next-rollback.env" ] && mv "$STATE/next-rollback.env" "$STATE/previous.env"
+  # previous.meta now describes the release just left, which ran on rev_now.
+  [ "$restore" = no ] || { restored_from=$backup; backup=""; }
+  printf 'SCHEMA_REV=%s\nBACKUP=%s\nAGENT_ID=%s\nRESTORED_FROM=%s\n' "$rev_now" "$backup" "$agent_now" "$restored_from" > "$STATE/previous.meta"
+  # Hold the release just left, or the next timer run puts it straight back.
+  [ -z "$from" ] || hold_add "$from" || true
+  [ -z "$to" ] || hold_clear "$to"
+  # The gate passed on the previous images with the database as it is: whatever
+  # was blocked is resolved (a plain rollback is only allowed when the schema matches).
+  rm -f "$STATE/blocked"
+  inflight_end
+  [ -z "$restored_from" ] || log "database restored from $restored_from (schema $rev_prev)"
+  log "rolled back to $(current_tag); ${from:-the previous release} is held (the timer will not re-apply it; \`hs-release apply ${from:-TAG}\` does)"
+  if [ -f "$STATE/broken" ]; then log "the broken marker is still set: when everything is as it should be, run hs-release clear-broken"; fi
+}
+
+# Keep the timer from following TAG (it stays in $STATE/refused until a person
+# applies it, a rollback lands on it, or the line is deleted).
+cmd_hold() {
+  local t=${1:-}
+  [[ $t =~ $RELEASE_RE ]] || { echo "usage: hs-release hold <tag>   (a Determinity release tag, vX.Y.Z-determinity.N)" >&2; return 64; }
+  mkdir -p "$STATE"
+  lock
+  hold_add "$t" || die "$t is NOT held: the timer may still apply it (see $STATE/refused)"
+  log "$t is held by hand: the timer will not apply it. Lifted by: hs-release apply $t, a rollback that lands on it, or deleting its line from $STATE/refused"
+}
+
+# A person has fixed it: verify the pinned stack, then lift the stop.
+cmd_clear_broken() {
+  local force=no
+  [ "${1:-}" = --force ] && force=yes
+  mkdir -p "$STATE"
+  lock
+  if [ ! -f "$STATE/broken" ] && [ ! -f "$STATE/inflight" ]; then
+    if [ -f "$STATE/blocked" ]; then
+      echo "no broken marker to clear, but the state is BLOCKED (schema moved after a failed release $(meta_get "$STATE/blocked" tag); services stopped: $(meta_get "$STATE/blocked" services_stopped))."
+      echo "clear-broken does not lift it. Restore the database: hs-release rollback --restore-db (external database: restore it yourself, then hs-release rollback --db-restored); or re-run the gate on the pinned release: hs-release apply $(meta_get "$STATE/blocked" tag); or fix forward: hs-release apply <healthy tag>"
+      return 3
+    fi
+    echo "nothing to clear"; return 0
+  fi
+  if [ "$force" = no ] && ! healthy; then
+    die "the stack pinned in release.env ($(current_tag || true)) does not pass the health gate; fix it, or --force to clear anyway"
+  fi
+  sync_current
+  rm -f "$STATE/broken" "$STATE/inflight"
+  # A killed re-gate leaves its "a re-gate is running" note in blocked; nothing is running now.
+  case $(meta_get "$STATE/blocked" services_stopped) in
+    "unknown (a re-gate is running"*)
+      set_blocked_stopped "unknown (a re-gate was killed before it finished: backend and scheduler may be running; check docker ps)" ;;
+  esac
+  log "broken marker cleared by hand ($([ "$force" = yes ] && echo 'forced' || echo 'health gate passed')); running: $(current_tag || true)"
+  if [ -f "$STATE/blocked" ]; then
+    log "the BLOCKED state is still set (failed release $(meta_get "$STATE/blocked" tag); services stopped: $(meta_get "$STATE/blocked" services_stopped)): clear-broken does not lift it. Run: hs-release apply $(meta_get "$STATE/blocked" tag) (re-runs the gate), hs-release rollback --restore-db, or hs-release apply <healthy tag>"
+    return 3
+  fi
+}
+
+cmd_check() {
+  local latest
+  if [ -f "$STATE/broken" ]; then broken_line; return 4; fi
+  latest=$(fetch_release latest | jq -r .tag)
+  if [ "$latest" = "$(current_tag)" ]; then echo "up to date: $latest"; return 0; fi
+  if held "$latest"; then echo "latest $latest is refused/held here ($(held_reasons)); running: $(current_tag || true)"; return 0; fi
+  echo "newer release: $latest (running: $(current_tag || true))"; return 10
+}
+
+cmd_status() {
+  local latest rel stopped what
+  broken_line
+  [ ! -f "$STATE/inflight" ] || [ -f "$STATE/broken" ] || echo "INTERRUPTED: a run was killed mid-switch ($(paste -sd' ' "$STATE/inflight")); the next apply records it as broken"
+  if [ -f "$STATE/blocked" ]; then
+    echo "BLOCKED: schema moved after a failed release ($(meta_get "$STATE/blocked" tag)); services stopped: $(meta_get "$STATE/blocked" services_stopped); see $STATE/blocked"
+    echo "  fix: hs-release rollback --restore-db (or --db-restored on an external database), or hs-release apply <tag> once a healthy release is out; hs-release apply $(meta_get "$STATE/blocked" tag) re-runs the gate on the pinned release"
+  fi
+  if [ -f "$STATE/broken" ]; then echo "pinned in release.env: $(current_tag || true) (not verified healthy)"
+  elif [ -f "$STATE/blocked" ]; then
+    stopped=$(meta_get "$STATE/blocked" services_stopped)
+    case $stopped in
+      "backend scheduler") what="failed the health gate, NOT a running release" ;;
+      none) what="failed the health gate; nothing was stopped, so it is running and NOT verified healthy" ;;
+      *) what="failed the health gate; the stop did not finish or failed, so it may be serving: check docker ps" ;;
+    esac
+    echo "pinned in release.env: $(current_tag || true) ($what; services stopped: $stopped)"
+  else echo "running: $(current_tag || true)"; fi
+  if rel=$(fetch_release latest 2>/dev/null) && latest=$(jq -er .tag <<<"$rel"); then
+    echo "latest:  $latest"
+    drift_message "$rel" | sed 's/^/WARNING: /'
+  else echo "latest:  unknown (API read failed)"; fi
+  if [ -f "$STATE/previous.env" ]; then echo "rollback: $(tag_of "$STATE/previous.env")"; fi
+  if [ -s "$STATE/refused" ]; then echo "held/refused: $(paste -sd' ' "$STATE/refused")"; fi
+  alert_unset_line
+  return 0
+}
+
+# HS_RELEASE_SOURCED=1 loads the functions without running a command (tests).
+if [ -z "${HS_RELEASE_SOURCED:-}" ]; then
+  mkdir -p "$STATE"
+  trap loud_exit_warning EXIT
+  case "${1:-}" in
+    apply) shift; cmd_apply "$@" ;;
+    rollback) shift; cmd_rollback "$@" ;;
+    clear-broken) shift; cmd_clear_broken "$@" ;;
+    hold) shift; cmd_hold "$@" ;;
+    check) cmd_check ;;
+    status) cmd_status ;;
+    *) echo "usage: hs-release status|check|apply [TAG]|rollback [--restore-db|--db-restored]|clear-broken [--force]|hold <tag>" >&2; exit 64 ;;
+  esac
+fi

@@ -1,0 +1,46 @@
+name: hq homeserver tests
+
+# Runs every homeserver/ test suite (the release follower, the box services,
+# the agent image overlay) on pull requests to `hq` and on pushes to it. The
+# inherited CI workflows never look at homeserver/, so without this a change to
+# the updater that runs as root on a server would reach a release untested.
+# The release workflow runs the same script before it builds anything.
+
+on:
+  pull_request:
+    branches: [hq]
+    paths:
+      - 'homeserver/**'
+      - '.github/workflows/hq-homeserver-tests.yml'
+  push:
+    branches: [hq]
+    paths:
+      - 'homeserver/**'
+      - '.github/workflows/hq-homeserver-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: homeserver tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          for f in homeserver/release/hs-release homeserver/release/hs-release-alert \
+                   homeserver/release/determinity-version; do
+            bash -n "$f"
+          done
+      - name: Test suites
+        run: bash homeserver/ci/run-homeserver-tests.sh
