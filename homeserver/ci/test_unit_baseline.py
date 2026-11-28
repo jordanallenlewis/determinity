@@ -138,5 +138,40 @@ class Workflows(unittest.TestCase):
         self.assertNotRegex(text, r"(?m)^\s+paths(-ignore)?:")
 
 
+class ImageWorkflows(unittest.TestCase):
+    def read(self, name):
+        with open(os.path.join(ROOT, ".github", "workflows", name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_release_has_no_agent_image_job(self):
+        text = self.read("determinity-release.yml")
+        self.assertNotRegex(text, r"(?m)^  agent-image:")
+        self.assertNotIn("digest-agent", text)
+        self.assertRegex(text, r"(?m)^    needs: \[plan, images\]$")
+        self.assertNotIn("agent-image", text.split("\n  release:\n", 1)[1])
+        self.assertIn("for img in backend frontend scheduler mcp-server; do", text)
+
+    def test_images_check_runs_only_on_pull_requests_into_hq(self):
+        text = self.read("hq-images-check.yml")
+        on = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual([l.strip() for l in on.strip().split("\n")], ["pull_request:", "branches: [hq]"])
+        self.assertRegex(text, r"(?m)^permissions:\n  contents: read\n")
+        self.assertRegex(text, r"(?m)^  cancel-in-progress: true$")
+
+    def test_images_check_never_pushes_or_writes_cache(self):
+        text = self.read("hq-images-check.yml")
+        self.assertIn("push: false", text)
+        self.assertNotRegex(text, r"(?m)^\s*push:\s*true")
+        self.assertNotIn("cache-to", text)
+        self.assertNotIn("docker/login-action", text)
+
+    def test_images_check_builds_the_images_hq_images_publishes(self):
+        def matrix(text):
+            return re.findall(r"- image: (\S+)\n\s+context: (\S+)\n\s+dockerfile: (\S+)\n\s+build_args: (\S+)", text)
+        published = matrix(self.read("hq-images.yml"))
+        self.assertEqual(len(published), 4)
+        self.assertEqual(matrix(self.read("hq-images-check.yml")), published)
+
+
 if __name__ == "__main__":
     unittest.main()

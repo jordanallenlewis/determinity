@@ -1,5 +1,9 @@
 # agent-image: hardened overlay for the agent base image
 
+## Known issue
+
+The self-test in `harden.sh` fails on a GitHub runner and would fail in a Trinity agent container. `hs-root-hook` runs as root and reads `/proc/1/environ`, but PID 1 runs as the agent user, and reading another user's process environment needs `CAP_SYS_PTRACE`, which Trinity does not grant. The hook refuses (as designed: "cannot read the container environment") and `harden.sh` rolls the tag back. Releases do not ship this image until that is fixed.
+
 ## What it does
 
 `Dockerfile` builds on top of Trinity's agent base image (upstream's `docker/base-image/Dockerfile` is not modified) and:
@@ -43,4 +47,4 @@ then recreate the agents.
 
 ## Validation status
 
-`bash -n harden.sh` passes, and `--help` and `DRY_RUN=1` run. The image was not built here: no Docker daemon was available in the authoring environment, so the Dockerfile, `visudo -c` and the self-test have not been run. Run step 2 once and read the output before relying on it. Note that the packages in the self-test (`rg jq pdftotext pandoc dig`) must match the package list in the Dockerfile if you change it.
+`bash -n harden.sh` passes, and `--help` and `DRY_RUN=1` run. Release dry run 2 (run 46103227165) built the image on a GitHub runner: the Dockerfile and `visudo -c` passed, and the self-test failed as described under "Known issue", so `harden.sh` rolled the tag back. The image has not passed its self-test anywhere yet. Note that the packages in the self-test (`rg jq pdftotext pandoc dig`) must match the package list in the Dockerfile if you change it.

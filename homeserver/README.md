@@ -48,7 +48,8 @@ instead of a hardcoded 30 minutes.
 **What:** an overlay built on Trinity's agent base image. It bakes in packages and replaces blanket passwordless
 sudo with a rule for Trinity's own startup commands only.
 **Why:** an agent that can sudo can switch off every guard inside its container.
-**Enable:** `agent-image/harden.sh <base-image-tag>`, then recreate the agents.
+**Enable:** not yet. `agent-image/harden.sh <base-image-tag>` currently fails its self-test and rolls back (see the
+[known issue](agent-image/README.md#known-issue)); the image is planned for `v1.0.5-determinity.2`.
 
 ### Agent firewall: [`firewall/`](firewall/)
 **What:** an nftables table that lets agent containers reach the internet and a short list of host ports, and

@@ -1,8 +1,9 @@
 name: Determinity release
 
 # Cuts a Determinity release from `hq`: tag v<upstream>-determinity.<n>, four
-# runtime images plus the hardened agent image, a GitHub Release marked latest,
-# and release.json (the machine-readable contract, see homeserver/RELEASES.md).
+# runtime images (the agent base image stays upstream's, see homeserver/RELEASES.md),
+# a GitHub Release marked latest, and release.json (the machine-readable
+# contract, see homeserver/RELEASES.md).
 #
 # Gate: pushes to `hq` start none of the inherited CI workflows (they run on
 # main/dev; a push to hq starts only hq-images.yml and hq-homeserver-tests.yml), so
@@ -388,109 +389,9 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # The agent base image, hardened (homeserver/agent-image). Built with the
-  # local docker engine, not buildx, because harden.sh builds on top of the
-  # upstream image by its local tag and self-tests the result before keeping
-  # it. A server tags the pulled image as trinity-agent-base:latest, the name
-  # the backend creates agents from; an agent picks it up when it is recreated.
-  agent-image:
-    name: agent (hardened base image)
-    needs: [plan, ci, unit, gate]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.plan.outputs.revision }}
-          submodules: false
-          persist-credentials: false
-
-      # The tag is created only by the release job, after every image job of
-      # the run has passed, and "Re-run failed jobs" never re-runs a job that
-      # passed. So an image job that finds the tag at all is a re-run of an
-      # older run (it would push its images over a later release's version
-      # tags) or a "Re-run all jobs" of a finished release (it would move the
-      # version tags to a new build). Either way: stop. Tags cannot be deleted
-      # (tag ruleset), so a number once tagged stays taken.
-      - name: Version not tagged yet
-        if: inputs.dry_run != true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          P_TAG: ${{ needs.plan.outputs.tag }}
-          P_REVISION: ${{ needs.plan.outputs.revision }}
-        run: |
-          set -euo pipefail
-          if sha=$(gh api "repos/${REPO}/git/ref/tags/${P_TAG}" --jq .object.sha 2>tag.err); then
-            if [ "$sha" = "$P_REVISION" ]; then
-              echo "::error::tag ${P_TAG} already exists on this revision: its images were pushed by the run that created it. Not pushing them again. If that run's release job failed, use \"Re-run failed jobs\" on it, which leaves the image jobs alone"
-            else
-              echo "::error::tag ${P_TAG} is on ${sha}, not ${P_REVISION}: this version is taken; not pushing images under it"
-            fi
-            exit 1
-          elif grep -q '(HTTP 404)' tag.err; then
-            echo "tag ${P_TAG} not created yet"
-          else
-            echo "::error::could not read tag ${P_TAG} ($(head -c 300 tag.err))"; exit 1
-          fi
-
-      - name: Overlay tests
-        run: python3 -I homeserver/agent-image/test_agent_image.py
-
-      - name: Build upstream base, then harden and self-test it
-        env:
-          P_VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          set -euo pipefail
-          # Same build args as upstream's publish-images.yml for this image.
-          docker build -q -t trinity-agent-base:latest \
-            --build-arg "VERSION=$(tr -d '[:space:]' < VERSION)" \
-            -f docker/base-image/Dockerfile ./docker/base-image
-          bash homeserver/agent-image/harden.sh trinity-agent-base:latest
-          [ -n "$(docker image inspect -f '{{index .Config.Labels "homeserver.hardened"}}' trinity-agent-base:latest)" ] \
-            || { echo "::error::agent image is not hardened"; exit 1; }
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push (version tags only; latest moves after the Release)
-        env:
-          OWNER: ${{ github.repository_owner }}
-          DRY: ${{ inputs.dry_run }}
-          P_VERSION: ${{ needs.plan.outputs.version }}
-          P_TAG: ${{ needs.plan.outputs.tag }}
-          P_SHORT: ${{ needs.plan.outputs.short_sha }}
-        run: |
-          set -euo pipefail
-          ref="ghcr.io/${OWNER,,}/determinity-agent"
-          tags="sha-${P_SHORT}"
-          [ "$DRY" = true ] || tags="$tags ${P_VERSION} ${P_TAG}"
-          for t in $tags; do
-            docker tag trinity-agent-base:latest "${ref}:${t}"
-            docker push -q "${ref}:${t}"
-          done
-          # The digest this job pushed (every tag above is the same image).
-          digest=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "${ref}:sha-${P_SHORT}" \
-                     | sed -n "s|^${ref}@||p" | head -1)
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no pushed digest for ${ref}"; exit 1; }
-          mkdir -p digest
-          echo "agent $ref $digest" > digest/agent
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digest-agent
-          path: digest/agent
-          if-no-files-found: error
-          retention-days: 30
-
   release:
     name: release (tag, Release, release.json, latest)
-    needs: [plan, images, agent-image]
+    needs: [plan, images]
     runs-on: ubuntu-latest
     # The tag ruleset lets only the deploy key create v*-determinity.* tags.
     # The key lives in this environment (deployments from `hq` only) and is
@@ -542,7 +443,7 @@ jobs:
           owner="${OWNER,,}"
           accept='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
           : > digests.txt
-          for img in backend frontend scheduler mcp-server agent; do
+          for img in backend frontend scheduler mcp-server; do
             [ -f "digest/${img}" ] || { echo "::error::no digest recorded for ${img} by this run"; exit 1; }
             read -r k name digest < "digest/${img}"
             [ "$k" = "$img" ] && [ "$name" = "ghcr.io/${owner}/determinity-${img}" ] \
@@ -622,8 +523,6 @@ jobs:
             while read -r img name digest; do
               echo "| \`${name}\` | \`${VERSION}\` | \`${digest}\` |"
             done < digests.txt
-            echo
-            echo "\`determinity-agent\` is the hardened agent base image (homeserver/agent-image). A server tags it \`trinity-agent-base:latest\`; each agent runs it from its next recreate."
             echo
             echo "Install, upgrade and roll back: [homeserver/RELEASES.md](https://github.com/${REPO}/blob/${TAG}/homeserver/RELEASES.md). Machine-readable: \`release.json\`, attached below."
           } > notes.md
