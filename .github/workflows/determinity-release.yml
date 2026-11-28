@@ -8,7 +8,7 @@ name: Determinity release
 # main/dev; a push to hq starts only hq-images.yml and hq-homeserver-tests.yml), so
 # the `ci` job dispatches the test workflows on `hq` itself and waits for them
 # to pass on exactly the revision being released, and the `unit` job runs the
-# backend unit suite against its committed failure baseline. A red or missing
+# backend unit suite against its committed failure baselines. A red or missing
 # run stops the release before any image is pushed.
 #
 # Run it from the Actions tab on `hq` (or `gh workflow run determinity-release.yml
@@ -168,29 +168,18 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      # Same steps as the `absolute` job in backend-unit-test.yml (push only):
-      # the whole unit suite, and no failure beyond the committed baseline.
+      # Same suite as the `absolute` job in backend-unit-test.yml (push only):
+      # no failure beyond upstream's baseline plus the fork's own
+      # (homeserver/ci/unit-failure-baseline.txt). hq-unit-baseline.yml runs
+      # the same script on pull requests into hq. GitHub does not start it by
+      # itself on the pull requests the upstream sync opens with the workflow
+      # token.
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r tests/requirements-test.txt 'pytest-randomly>=3.15.0' 'pytest-xdist>=3.5.0'
-      - name: Checker self-test
-        run: python scripts/ci/check-failure-baseline.py --self-test
-      - name: Run unit suite
-        run: |
-          cd tests
-          python -m pytest unit/ -m "not slow" \
-            --timeout=300 --timeout-method=signal \
-            -n logical --dist loadfile \
-            -p randomly --randomly-seed=12345 \
-            --junit-xml="$GITHUB_WORKSPACE/junit-release.xml" \
-            --tb=no -q || true
-      - name: Compare against the committed baseline
-        run: |
-          python scripts/ci/check-failure-baseline.py \
-            --xml junit-release.xml \
-            --baseline tests/unit_failure_baseline.txt \
-            --out "$GITHUB_STEP_SUMMARY"
+      - name: Unit suite against the committed baselines
+        run: bash homeserver/ci/run-unit-baseline.sh "$GITHUB_STEP_SUMMARY"
 
   gate:
     name: gate (frontend build, backend syntax)
