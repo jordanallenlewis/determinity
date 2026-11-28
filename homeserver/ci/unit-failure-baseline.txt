@@ -1,0 +1,18 @@
+# Unit-suite failures Determinity tolerates on top of upstream's tests/unit_failure_baseline.txt.
+# One pytest id per line, the spelling scripts/ci/check-failure-baseline.py prints; `#` comments allowed.
+# homeserver/ci/run-unit-baseline.sh checks the suite against both files together, so upstream's file stays
+# as upstream wrote it. Every entry but the last is an upstream test that checks the repository itself and
+# reads this fork differently from upstream. The last tolerates a known upstream defect until an upstream
+# release carries the fix: the Slack connect route returns the exception text in a 500 response. Upstream's
+# own releases ship the same code. Drop an entry when it starts passing (the check reports it).
+#
+# The fork's default branch is `hq`, not `main`, so these workflows exist only on `hq` and `main` has no copy.
+test_2814_workflow_trigger_parity::test_default_branch_registered_triggers_are_also_on_main[determinity-release.yml]
+test_2814_workflow_trigger_parity::test_default_branch_registered_triggers_are_also_on_main[hq-homeserver-tests.yml]
+test_2814_workflow_trigger_parity::test_default_branch_registered_triggers_are_also_on_main[hq-images.yml]
+test_2814_workflow_trigger_parity::test_default_branch_registered_triggers_are_also_on_main[hq-upstream-sync.yml]
+# determinity-release.yml and hq-unit-baseline.yml run the unit suite; docs/testing/STRATEGY.md is upstream's lane table.
+test_2339_testing_docs_consolidated::test_strategy_names_every_test_running_workflow_and_only_real_ones
+# Upstream hold for src/backend/routers/slack.py (500 with detail=str(e)) that expired on 2026-11-19;
+# fixed upstream on dev in abilityai/trinity#4646 (issue #4339), not yet released.
+test_4284_no_exception_text_in_5xx::test_held_entries_have_not_expired
